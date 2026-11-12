@@ -23,6 +23,7 @@
 import { createOrganAudio, voiceKey } from './audio.js';
 import { META, STOPS, COUPLERS, ACCESSORIES, stopById, stopsOfDivision } from './stoplist.js';
 import { parseMidiFile, midiToScore, formatTime, MIDI_MAX_SECONDS, MIDI_MAX_POLYPHONY, MIDI_MAX_BYTES } from './demos.js';
+import { PIECES, compilePiece, pieceRegistration } from './pieces.js';
 export { parseMidiFile, midiToScore, splitPedal, foldIntoCompass, capPolyphony, removeOverlaps, formatTime, MIDI_MAX_SECONDS, MIDI_MAX_POLYPHONY } from './demos.js';
 
 export const MANUAL_CHOIR = 0;
@@ -669,11 +670,12 @@ export function buildDemoScore() {
   return ev;
 }
 
-/** Time-ordered timeline: at equal times note-offs, then pistons, then note-ons. */
+/** Time-ordered timeline: at equal times note-offs, then pistons / registration changes, then note-ons. */
 export function scoreToTimeline(score) {
   const tl = [];
   for (const e of score) {
     if (e.piston) { tl.push({ time: e.t, piston: e.piston, ord: 1 }); continue; }
+    if (e.reg) { tl.push({ time: e.t, reg: e.reg, ord: 1 }); continue; }
     tl.push({ time: e.t, on: true, midi: e.midi, manual: e.manual, ord: 2 });
     tl.push({ time: e.t + e.dur, on: false, midi: e.midi, manual: e.manual, ord: 0 });
   }
@@ -682,18 +684,23 @@ export function scoreToTimeline(score) {
 }
 
 /** Built-in pieces for the demo menu. */
+// After BWV 565: Pachelbel, Bach BWV 147, Elgar, Clarke (note data, sources and compiler in pieces.js).
+// Their registration also sets swell pedals; score events { reg: { on, off, swell } }
+// change the registration mid-piece. Everything is restored afterwards.
 export const DEMO_PIECES = [
-  { id: 'bwv565', title: 'Toccata d-Moll BWV 565', subtitle: 'J. S. Bach, Anfang (gemeinfrei) · Plenum mit Tubas', build: () => buildDemoScore(), registration: DEMO_REGISTRATION },
+  { id: 'bwv565', title: 'Toccata d-Moll BWV 565', subtitle: 'J. S. Bach (1685–1750) · Anfang (gemeinfrei) · Plenum mit Tubas', build: () => buildDemoScore(), registration: DEMO_REGISTRATION },
+  ...PIECES.map((def) => ({ id: def.id, title: def.title, subtitle: def.subtitle, composer: def.composer, dates: def.dates, source: def.source || null, build: () => compilePiece(def).score, registration: pieceRegistration(def) })),
 ];
 
 /**
  * Demo auto-player (pure; time is passed in, in seconds).
  *   capture() -> registration snapshot;  restore(snapshot);  applyRegistration(snapshot);  pressPiston(id)
+ *   applyChange({ on, off, swell }) for registration events { reg } inside a score
  * start(piece?) plays a piece { id, title, score, registration, keepRegistration, keepOnUserInput };
  * without an argument the default score / registration given here.
  * keepRegistration: the current registration is neither changed nor restored (MIDI files).
  */
-export function createDemoPlayer({ book, capture, restore, applyRegistration, pressPiston, onState, score = buildDemoScore(), registration = DEMO_REGISTRATION, source = 'demo' }) {
+export function createDemoPlayer({ book, capture, restore, applyRegistration, pressPiston, applyChange, onState, score = buildDemoScore(), registration = DEMO_REGISTRATION, source = 'demo' }) {
   const defaultPiece = { id: 'bwv565', title: DEMO_PIECES[0].title, score, registration };
   let piece = defaultPiece;
   let timeline = scoreToTimeline(score);
@@ -731,7 +738,7 @@ export function createDemoPlayer({ book, capture, restore, applyRegistration, pr
     elapsed = t;
     while (playing && index < timeline.length && timeline[index].time <= t) {
       const e = timeline[index++];
-      if (e.piston) { if (pressPiston) pressPiston(e.piston); } else if (e.on) book.press(source, e.midi, e.manual);
+      if (e.piston) { if (pressPiston) pressPiston(e.piston); } else if (e.reg) { if (applyChange) applyChange(e.reg); } else if (e.on) book.press(source, e.midi, e.manual);
       else book.release(source, e.midi, e.manual);
     }
     if (playing && index >= timeline.length && t > duration + 0.4) stop();
@@ -964,7 +971,7 @@ const CSS = `
 .rah-help a:hover { text-decoration-color: #f3d48c; }
 .rah-help .rah-about { margin-top: 14px; padding-top: 4px; border-top: 1px solid rgba(217, 164, 65, 0.2); }
 .rah-help .rah-about dd { font-size: 13px; }
-.rah-demo-menu { position: absolute; left: 50%; bottom: 76px; transform: translateX(-50%); width: 380px; max-width: calc(100vw - 24px); padding: 8px 6px 6px; z-index: 3; }
+.rah-demo-menu { position: absolute; left: 50%; bottom: 76px; transform: translateX(-50%); width: 380px; max-width: calc(100vw - 24px); max-height: calc(100vh - 110px); overflow-y: auto; padding: 8px 6px 6px; z-index: 3; }
 .rah-demo-menu[hidden] { display: none; }
 .rah-mh { font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; color: rgba(217, 164, 65, 0.85); padding: 0 8px 4px; }
 .rah-mi { display: flex; flex-direction: column; gap: 1px; padding: 6px 10px; border-radius: 4px; cursor: pointer; outline: none; }
@@ -1085,7 +1092,10 @@ const HELP_HTML_CONTROLS = `
 <h3>Demo &amp; MIDI-Dateien</h3>
 <dl>
   <dt>Demo-Menü</dt><dd>„▶ Demo“ (Leiste unten) öffnet das Menü; mit der Tastatur ${K('Enter')} / ${K('Leertaste')} öffnen, ${K('↓')} ${K('↑')} wählen, ${K('Enter')} startet, ${K('Esc')} schließt. Während der Wiedergabe zeigt der Knopf „■ Stopp“ und den Titel; Klick darauf oder ${K('Esc')} beendet sie. Fortschritt und Dauer stehen darüber.</dd>
-  <dt>BWV 565</dt><dd>Anfang von J. S. Bachs Toccata d-Moll BWV 565 im Plenum; der Schlussakkord mit Tubas über Kolben. Die Registrierung wird danach wiederhergestellt; jede eigene Taste beendet die Demo.</dd>
+  <dt>Eingebaute Stücke</dt><dd>Alle gemeinfrei (Komponisten seit über 70 Jahren tot); kurze Ausschnitte, jeweils mit eigener Registrierung (Register, Koppeln, Schweller, teils Wechsel während des Stücks):
+    <ul>${DEMO_PIECES.map((p) => `<li><b>${p.title}</b> – ${p.subtitle}${p.source ? ` <small>(Quelle: ${p.source.credit}, ${p.source.licence})</small>` : ''}</li>`).join('')}</ul>
+    Bach BWV 565: Anfang der Toccata im Plenum, Schlussakkord mit Tubas über Kolben. Pachelbel: Bassfundament und die drei Oberstimmen im Kanon (Viertel-, dann Achtelvariation) wie in der Quelle, Stimmen auf Solo, Swell und Great, am Ende ein gehaltener Schlussakkord ergänzt. Bach BWV 147: Ritornell mit der Triolenlinie (Swell) und die ersten zwei Choralzeilen (Melodie auf der Solo-Oboe) wie in der Quelle; deren Klavierverdopplung des Chors entfällt, im letzten Takt hält das Pedal den Grundton. Elgar: die Trio-Melodie einmal ganz, Mittelstimmen vereinfacht, Schluss mit Tubas. Clarke: Hauptteil mit Wiederholung, erstes Couplet und Hauptteil, Melodie auf Solo-Trompete bzw. Tuba; Tenor und Bass eigene Harmonisierung.
+    Die eigene Registrierung (auch die Schwelltritte) wird danach wiederhergestellt; jede eigene Taste oder „■ Stopp“ beendet die Demo.</dd>
   <dt>Eigene MIDI-Datei</dt><dd>„Eigene MIDI-Datei laden…“ im Menü oder eine .mid/.midi-Datei einfach auf die Seite ziehen. Die Datei wird nur im Browser gelesen – sie bleibt auf deinem Gerät und wird weder hochgeladen noch gespeichert. Sie spielt mit der <b>aktuellen</b> Registrierung: Register dürfen währenddessen gezogen und eigene Töne gespielt werden, nur „■ Stopp“ oder ${K('Esc')} beendet sie.</dd>
   <dt>Zuordnung</dt><dd>Mehrere MIDI-Kanäle bzw. Spuren: 1. → Great, 2. → Swell, 3. → Choir, 4. → Solo (weitere → Great); ab drei Stimmen geht eine tiefe Basstimme ins Pedal. Sonst übernimmt das Pedal die tiefste Stimme unter c (MIDI 48). Kanal 10 (Schlagzeug) wird ignoriert; Töne außerhalb des Umfangs werden oktaviert (Manuale C–c′′′′, Pedal C–g′).</dd>
   <dt>Grenzen</dt><dd>Standard-MIDI-Dateien Format 0 und 1 (bis 4 MB); höchstens ${MIDI_MAX_POLYPHONY} gleichzeitige Töne (überzählige Mittelstimmen werden gekürzt), höchstens ${MIDI_MAX_SECONDS / 60} Minuten Wiedergabe. Tempowechsel werden berücksichtigt, Anschlagstärke, Pedal-, Programm- und Controller-Befehle nicht.</dd>
@@ -1258,11 +1268,15 @@ export function initInteraction(ctx) {
   function syncTutti() { if (ui.tuttiBtn) ui.tuttiBtn.setAttribute('aria-pressed', tuttiSaved ? 'true' : 'false'); }
 
   // ---- demo ---------------------------------------------------------------
+  // demo registration includes the swell pedals (built-in pieces may set and change them)
+  const setAnyControl = (id, on) => (STOP_SET.has(id) ? setStop(id, on) : COUPLER_BY_ID.has(id) ? setCoupler(id, on) : TREMULANT_IDS.includes(id) ? setTremulant(id, on) : false);
+  const applySwells = (sw) => { for (const [id, v] of Object.entries(sw || {})) setSwell(id, v); };
   const demo = createDemoPlayer({
     book,
-    capture: snapshot,
-    restore: (s) => { applySnapshot(s); },
-    applyRegistration: (s) => applySnapshot(s),
+    capture: () => ({ ...snapshot(), swell: Object.fromEntries(swell) }),
+    restore: (s) => { applySnapshot(s); applySwells(s.swell); },
+    applyRegistration: (s) => { applySnapshot(s); applySwells(s.swell); },
+    applyChange: (c) => batch(() => { for (const id of c.off || []) setAnyControl(id, false); for (const id of c.on || []) setAnyControl(id, true); applySwells(c.swell); }),
     pressPiston,
     onState: (playing, piece) => {
       if (ui.demoBtn) {
@@ -2153,7 +2167,7 @@ export function initInteraction(ctx) {
       ui.menuItems.push(it);
       return it;
     };
-    menu.append(el('div', { class: 'rah-mh', text: 'Demo-Stücke' }));
+    menu.append(el('div', { class: 'rah-mh', text: 'Demo-Stücke · gemeinfrei, Ausschnitte für dieses Modell eingerichtet' }));
     for (const p of DEMO_PIECES) menu.append(item({ 'data-piece': p.id }, `▶ ${p.title}`, p.subtitle));
     menu.append(el('div', { class: 'rah-msep', role: 'separator' }));
     menu.append(item({ 'data-action': 'file' }, 'Eigene MIDI-Datei laden…', `.mid / .midi, auch per Ziehen & Ablegen · spielt mit deiner Registrierung · max. ${MIDI_MAX_SECONDS / 60} Minuten`));
