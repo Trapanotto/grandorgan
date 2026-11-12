@@ -22,6 +22,8 @@
 
 import { createOrganAudio, voiceKey } from './audio.js';
 import { META, STOPS, COUPLERS, ACCESSORIES, stopById, stopsOfDivision } from './stoplist.js';
+import { parseMidiFile, midiToScore, formatTime, MIDI_MAX_SECONDS, MIDI_MAX_POLYPHONY, MIDI_MAX_BYTES } from './demos.js';
+export { parseMidiFile, midiToScore, splitPedal, foldIntoCompass, capPolyphony, removeOverlaps, formatTime, MIDI_MAX_SECONDS, MIDI_MAX_POLYPHONY } from './demos.js';
 
 export const MANUAL_CHOIR = 0;
 export const MANUAL_GREAT = 1;
@@ -679,23 +681,40 @@ export function scoreToTimeline(score) {
   return tl;
 }
 
+/** Built-in pieces for the demo menu. */
+export const DEMO_PIECES = [
+  { id: 'bwv565', title: 'Toccata d-Moll BWV 565', subtitle: 'J. S. Bach, Anfang (gemeinfrei) · Plenum mit Tubas', build: () => buildDemoScore(), registration: DEMO_REGISTRATION },
+];
+
 /**
  * Demo auto-player (pure; time is passed in, in seconds).
  *   capture() -> registration snapshot;  restore(snapshot);  applyRegistration(snapshot);  pressPiston(id)
+ * start(piece?) plays a piece { id, title, score, registration, keepRegistration, keepOnUserInput };
+ * without an argument the default score / registration given here.
+ * keepRegistration: the current registration is neither changed nor restored (MIDI files).
  */
 export function createDemoPlayer({ book, capture, restore, applyRegistration, pressPiston, onState, score = buildDemoScore(), registration = DEMO_REGISTRATION, source = 'demo' }) {
-  const timeline = scoreToTimeline(score);
-  const duration = timeline.length ? timeline[timeline.length - 1].time : 0;
+  const defaultPiece = { id: 'bwv565', title: DEMO_PIECES[0].title, score, registration };
+  let piece = defaultPiece;
+  let timeline = scoreToTimeline(score);
+  let duration = timeline.length ? timeline[timeline.length - 1].time : 0;
   let playing = false;
   let startTime = null;
+  let elapsed = 0;
   let index = 0;
   let saved = null;
-  function start() {
-    if (playing) return;
-    playing = true; startTime = null; index = 0;
-    saved = capture ? capture() : null;
-    if (applyRegistration) applyRegistration(registration);
-    if (onState) onState(true);
+  function load(p) {
+    piece = p || defaultPiece;
+    timeline = piece.timeline || scoreToTimeline(piece.score || []);
+    duration = timeline.length ? timeline[timeline.length - 1].time : 0;
+  }
+  function start(p) {
+    if (playing) stop();
+    load(p);
+    playing = true; startTime = null; index = 0; elapsed = 0;
+    saved = !piece.keepRegistration && capture ? capture() : null;
+    if (!piece.keepRegistration && applyRegistration && piece.registration) applyRegistration(piece.registration);
+    if (onState) onState(true, piece);
   }
   function stop() {
     if (!playing) return;
@@ -703,12 +722,13 @@ export function createDemoPlayer({ book, capture, restore, applyRegistration, pr
     book.releaseSource(source);
     if (restore && saved) restore(saved);
     saved = null;
-    if (onState) onState(false);
+    if (onState) onState(false, piece);
   }
   function update(now) {
     if (!playing) return;
     if (startTime === null) startTime = now;
     const t = now - startTime;
+    elapsed = t;
     while (playing && index < timeline.length && timeline[index].time <= t) {
       const e = timeline[index++];
       if (e.piston) { if (pressPiston) pressPiston(e.piston); } else if (e.on) book.press(source, e.midi, e.manual);
@@ -716,7 +736,21 @@ export function createDemoPlayer({ book, capture, restore, applyRegistration, pr
     }
     if (playing && index >= timeline.length && t > duration + 0.4) stop();
   }
-  return { start, stop, update, toggle: () => (playing ? stop() : start()), isPlaying: () => playing, duration, timeline };
+  return {
+    start, stop, update,
+    toggle: (p) => (playing ? stop() : start(p)),
+    isPlaying: () => playing,
+    piece: () => piece,
+    stopsOnUserInput: () => playing && !piece.keepOnUserInput,
+    progress: () => ({ elapsed: Math.min(elapsed, duration), duration, fraction: duration ? Math.min(1, elapsed / duration) : 0 }),
+    get duration() { return duration; },
+    get timeline() { return timeline; },
+  };
+}
+
+/** A parsed + mapped MIDI file as a demo piece (plays on the current registration). */
+export function midiPiece(name, mapped) {
+  return { id: 'midi-file', title: name, score: mapped.score, registration: null, keepRegistration: true, keepOnUserInput: true, notices: mapped.notices || [] };
 }
 
 // ---------------------------------------------------------------------------
@@ -930,6 +964,33 @@ const CSS = `
 .rah-help a:hover { text-decoration-color: #f3d48c; }
 .rah-help .rah-about { margin-top: 14px; padding-top: 4px; border-top: 1px solid rgba(217, 164, 65, 0.2); }
 .rah-help .rah-about dd { font-size: 13px; }
+.rah-demo-menu { position: absolute; left: 50%; bottom: 76px; transform: translateX(-50%); width: 380px; max-width: calc(100vw - 24px); padding: 8px 6px 6px; z-index: 3; }
+.rah-demo-menu[hidden] { display: none; }
+.rah-mh { font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; color: rgba(217, 164, 65, 0.85); padding: 0 8px 4px; }
+.rah-mi { display: flex; flex-direction: column; gap: 1px; padding: 6px 10px; border-radius: 4px; cursor: pointer; outline: none; }
+.rah-mi:focus, .rah-mi:hover { background: rgba(217, 164, 65, 0.22); }
+.rah-mi:focus-visible { box-shadow: inset 0 0 0 2px #f3d48c; }
+.rah-mi-t { font-size: 14.5px; color: #f3e3bd; }
+.rah-mi-s { font-size: 12px; font-style: italic; color: rgba(240, 230, 210, 0.65); }
+.rah-msep { height: 1px; margin: 5px 6px; background: rgba(217, 164, 65, 0.25); }
+.rah-mnote { margin: 4px 10px 2px; font-size: 11.5px; font-style: italic; color: rgba(240, 230, 210, 0.55); }
+.rah-now { position: absolute; left: 50%; bottom: 76px; transform: translateX(-50%); width: 380px; max-width: calc(100vw - 24px); padding: 8px 12px 9px; display: flex; flex-direction: column; gap: 5px; font-size: 13px; pointer-events: none; }
+.rah-now[hidden] { display: none; }
+.rah-now-h { display: flex; justify-content: space-between; gap: 10px; }
+.rah-now-t { font-weight: 400; color: #f3d48c; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rah-now-time { flex: none; font-variant-numeric: tabular-nums; color: rgba(240, 230, 210, 0.75); }
+.rah-now-bar { display: block; height: 3px; border-radius: 2px; background: rgba(217, 164, 65, 0.2); overflow: hidden; }
+.rah-now-bar[hidden] { display: none; }
+.rah-now-fill { display: block; height: 100%; width: 0; background: #d9a441; }
+.rah-now-note { font-size: 11.5px; font-style: italic; color: rgba(240, 230, 210, 0.6); }
+.rah-now.rah-error { border-color: #e48a78; }
+.rah-now.rah-error .rah-now-t { color: #ff9f8a; }
+.rah-drop { position: absolute; inset: 0; z-index: 20; pointer-events: none; display: flex; align-items: center; justify-content: center; background: rgba(10, 6, 4, 0.55); border: 3px dashed rgba(243, 212, 140, 0.8); }
+.rah-drop[hidden] { display: none; }
+.rah-drop-box { display: flex; flex-direction: column; gap: 6px; align-items: center; padding: 18px 26px; border-radius: 8px; background: rgba(14, 9, 7, 0.92); border: 1px solid #d9a441; text-align: center; }
+.rah-drop-box b { font-weight: 400; font-size: 20px; letter-spacing: 0.08em; color: #f3d48c; }
+.rah-drop-box span { font-size: 13.5px; font-style: italic; color: rgba(240, 230, 210, 0.8); }
+.rah-demo-btn { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
 .rah-tip { position: fixed; z-index: 10; pointer-events: none; max-width: 300px; padding: 5px 9px; font-size: 13px; line-height: 1.3; color: #f0e6d2; background: rgba(10, 6, 4, 0.92); border: 1px solid rgba(217, 164, 65, 0.55); border-radius: 4px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6); white-space: pre-line; }
 .rah-tip[hidden] { display: none; }
 .rah-tip b { font-weight: 400; color: #f3d48c; }
@@ -958,6 +1019,7 @@ const CSS = `
   .rah-bar { left: 8px; right: 8px; bottom: 8px; transform: none; width: fit-content; max-width: none; margin: 0 auto; gap: 5px; padding: 6px; }
   .rah-bar .rah-btn { padding: 6px 9px; font-size: 13px; }
   .rah-help { bottom: 60px; max-height: calc(100% - 160px); }
+  .rah-demo-menu, .rah-now { bottom: 60px; }
 }
 @media (min-width: 600px) and (max-width: 699px) {
   .rah-root:has(> .rah-panel:not(.rah-collapsed)) .rah-h1-suffix { display: none; }
@@ -1007,7 +1069,7 @@ const HELP_HTML_CONTROLS = `
 <dl>
   <dt>Generalkolben</dt><dd>${K('1')} … ${K('9')} ${K('0')} = General 1–10 (auch Ziffernblock).</dd>
   <dt>Divisionalkolben</dt><dd>${K('⇧')} + ${K('1')} … ${K('0')} für das gewählte Manual (Choir: 1–5 Choir, 6–0 Orchestral; Solo: 1–5 Solo, 6–0 feste Bombard-Kolben; Pedal: Fußtritte 1–10).</dd>
-  <dt>Auslöser</dt><dd>${K('Esc')} oder ${K('Entf')} = Generalauslöser (Esc schließt zuerst diese Hilfe bzw. verlässt die Suche).</dd>
+  <dt>Auslöser</dt><dd>${K('Esc')} oder ${K('Entf')} = Generalauslöser (Esc schließt zuerst diese Hilfe bzw. das Demo-Menü, beendet eine laufende Wiedergabe oder verlässt die Suche).</dd>
   <dt>Sequenzer</dt><dd>${K('+')} vor, ${K('-')} zurück durch die Generalkombinationen.</dd>
   <dt>Setzer</dt><dd>${K('*')} oder ${K('Einfg')} schaltet den Setzer; danach einen Kolben drücken speichert die aktuelle Registrierung (bleibt im Browser gespeichert).</dd>
   <dt>Schweller</dt><dd>${K('Bild↑')} / ${K('Bild↓')} öffnet / schließt den Schwellkasten des gewählten Manuals um 10 % (mit ${K('⇧')} ganz). Great und Pedal steuern den Swell-Kasten.</dd>
@@ -1019,7 +1081,14 @@ const HELP_HTML_CONTROLS = `
   <dt>Navigation</dt><dd>${K('Tab')} springt zwischen den Gruppen, Pfeiltasten bewegen sich innerhalb einer Gruppe, ${K('Leertaste')} / ${K('Enter')} schalten. In der Reiterleiste wechseln ${K('←')} ${K('→')} das Werk.</dd>
   <dt>Kennzeichen</dt><dd>Zungenregister rot; „↗ aus Nr. n“ = Transmission oder Extension aus Register n (keine eigenen Pfeifen bzw. nur die Zusatzoktave).</dd>
   <dt>MIDI</dt><dd>Kanal 1 spielt das gewählte Manual, Kanal 2–5 Choir, Great, Swell, Solo, Kanal 6 das Pedal.</dd>
-  <dt>Demo</dt><dd>Anfang von J. S. Bachs Toccata d-Moll BWV 565 im Plenum; der Schlussakkord mit Tubas über Kolben. Die Registrierung wird danach wiederhergestellt; jede eigene Taste beendet die Demo.</dd>
+</dl>
+<h3>Demo &amp; MIDI-Dateien</h3>
+<dl>
+  <dt>Demo-Menü</dt><dd>„▶ Demo“ (Leiste unten) öffnet das Menü; mit der Tastatur ${K('Enter')} / ${K('Leertaste')} öffnen, ${K('↓')} ${K('↑')} wählen, ${K('Enter')} startet, ${K('Esc')} schließt. Während der Wiedergabe zeigt der Knopf „■ Stopp“ und den Titel; Klick darauf oder ${K('Esc')} beendet sie. Fortschritt und Dauer stehen darüber.</dd>
+  <dt>BWV 565</dt><dd>Anfang von J. S. Bachs Toccata d-Moll BWV 565 im Plenum; der Schlussakkord mit Tubas über Kolben. Die Registrierung wird danach wiederhergestellt; jede eigene Taste beendet die Demo.</dd>
+  <dt>Eigene MIDI-Datei</dt><dd>„Eigene MIDI-Datei laden…“ im Menü oder eine .mid/.midi-Datei einfach auf die Seite ziehen. Die Datei wird nur im Browser gelesen – sie bleibt auf deinem Gerät und wird weder hochgeladen noch gespeichert. Sie spielt mit der <b>aktuellen</b> Registrierung: Register dürfen währenddessen gezogen und eigene Töne gespielt werden, nur „■ Stopp“ oder ${K('Esc')} beendet sie.</dd>
+  <dt>Zuordnung</dt><dd>Mehrere MIDI-Kanäle bzw. Spuren: 1. → Great, 2. → Swell, 3. → Choir, 4. → Solo (weitere → Great); ab drei Stimmen geht eine tiefe Basstimme ins Pedal. Sonst übernimmt das Pedal die tiefste Stimme unter c (MIDI 48). Kanal 10 (Schlagzeug) wird ignoriert; Töne außerhalb des Umfangs werden oktaviert (Manuale C–c′′′′, Pedal C–g′).</dd>
+  <dt>Grenzen</dt><dd>Standard-MIDI-Dateien Format 0 und 1 (bis 4 MB); höchstens ${MIDI_MAX_POLYPHONY} gleichzeitige Töne (überzählige Mittelstimmen werden gekürzt), höchstens ${MIDI_MAX_SECONDS / 60} Minuten Wiedergabe. Tempowechsel werden berücksichtigt, Anschlagstärke, Pedal-, Programm- und Controller-Befehle nicht.</dd>
 </dl>
 <p>Tastenbelegung nach Position (deutsches Layout abgebildet). Kombinationen gelten pro Speicherebene (1–64).</p>
 `;
@@ -1195,18 +1264,125 @@ export function initInteraction(ctx) {
     restore: (s) => { applySnapshot(s); },
     applyRegistration: (s) => applySnapshot(s),
     pressPiston,
-    onState: (playing) => {
+    onState: (playing, piece) => {
       if (ui.demoBtn) {
         ui.demoBtn.classList.toggle('rah-active', playing);
-        ui.demoBtn.textContent = playing ? '■ Demo' : '▶ Demo';
+        ui.demoBtn.textContent = playing ? `■ Stopp · ${piece.title}` : '▶ Demo';
         ui.demoBtn.setAttribute('aria-pressed', playing ? 'true' : 'false');
+        ui.demoBtn.setAttribute('aria-haspopup', playing ? 'false' : 'menu');
+        ui.demoBtn.title = playing ? `Wiedergabe beenden: ${piece.title}` : 'Demo-Stück wählen oder eigene MIDI-Datei spielen';
       }
+      if (playing) showNow(piece); else hideNow();
     },
   });
-  updaters.push(() => demo.update(perfNow()));
+  updaters.push(() => { demo.update(perfNow()); updateNow(); });
+
+  function playPiece(p) {
+    audio.unlock();
+    closeDemoMenu(false);
+    releaseUserNotes();
+    if (p.notices && p.notices.length) status(p.notices.join(' '));
+    demo.start(p);
+  }
+  function playBuiltIn(id) {
+    const def = DEMO_PIECES.find((x) => x.id === id) || DEMO_PIECES[0];
+    playPiece({ id: def.id, title: def.title, score: def.build(), registration: def.registration });
+  }
+  /** bytes -> play; returns { ok, error? }. Never throws. */
+  function playMidiBytes(name, bytes) {
+    const parsed = parseMidiFile(bytes);
+    const mapped = midiToScore(parsed);
+    if (!mapped.ok) { showError(mapped.error); return mapped; }
+    const title = String(name || 'MIDI-Datei').replace(/\.(mid|midi|smf|kar)$/i, '') || 'MIDI-Datei';
+    playPiece(midiPiece(title, mapped));
+    return mapped;
+  }
+  async function playMidiFile(file) {
+    if (!file) return;
+    if (!/\.(mid|midi|smf|kar)$/i.test(file.name || '') && !/midi/.test(file.type || '')) { showError('Bitte eine MIDI-Datei (.mid oder .midi) wählen.'); return; }
+    if (file.size > MIDI_MAX_BYTES) { showError('Die Datei ist zu groß (höchstens 4 MB).'); return; }
+    let buf;
+    try {
+      buf = file.arrayBuffer ? await file.arrayBuffer() : await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsArrayBuffer(file); });
+    } catch { showError('Die Datei konnte nicht gelesen werden.'); return; }
+    playMidiBytes(file.name, buf);
+  }
+
+  // now-playing box (title, time, progress) and file errors
+  let nowShown = -1;
+  let errTimer = null;
+  function showNow(piece) {
+    if (!ui.now) return;
+    clearTimeout(errTimer);
+    ui.now.hidden = false;
+    ui.now.classList.remove('rah-error');
+    ui.nowTitle.textContent = piece.title;
+    ui.nowNote.textContent = piece.keepRegistration ? 'Spielt mit deiner Registrierung – Register dürfen gezogen werden. Die Datei bleibt auf deinem Gerät.' : 'Registrierung wird danach wiederhergestellt; eine eigene Taste beendet die Demo.';
+    if (piece.notices && piece.notices.length) ui.nowNote.textContent += ' ' + piece.notices.join(' ');
+    ui.nowBar.hidden = false;
+    nowShown = -1;
+    updateNow();
+  }
+  function hideNow() { if (ui.now && !ui.now.classList.contains('rah-error')) ui.now.hidden = true; }
+  function updateNow() {
+    if (!ui.now || ui.now.hidden || !demo.isPlaying()) return;
+    const p = demo.progress();
+    const sec = Math.floor(p.elapsed);
+    if (sec === nowShown && ui.nowFill.style.width) { ui.nowFill.style.width = `${(p.fraction * 100).toFixed(1)}%`; return; }
+    nowShown = sec;
+    ui.nowTime.textContent = `${formatTime(p.elapsed)} / ${formatTime(p.duration)}`;
+    ui.nowFill.style.width = `${(p.fraction * 100).toFixed(1)}%`;
+    ui.nowBar.setAttribute('aria-valuenow', String(Math.round(p.fraction * 100)));
+    ui.nowBar.setAttribute('aria-valuetext', `${formatTime(p.elapsed)} von ${formatTime(p.duration)}`);
+  }
+  function showError(msg) {
+    status(msg);
+    if (!ui.now) return;
+    ui.now.hidden = false;
+    ui.now.classList.add('rah-error');
+    ui.nowTitle.textContent = 'MIDI-Datei nicht abspielbar';
+    ui.nowTime.textContent = '';
+    ui.nowNote.textContent = msg;
+    ui.nowBar.hidden = true;
+    clearTimeout(errTimer);
+    errTimer = setTimeout(() => { ui.now.classList.remove('rah-error'); if (!demo.isPlaying()) ui.now.hidden = true; }, 7000);
+  }
+
+  // demo menu (built in UI; state here so the keyboard handler can close it)
+  let menuOpen = false;
+  let menuIndex = 0;
+  const menuItems = () => ui.menuItems || [];
+  function focusMenuItem(i) {
+    const items = menuItems();
+    if (!items.length) return;
+    menuIndex = (i + items.length) % items.length;
+    items.forEach((it, k) => it.setAttribute('tabindex', k === menuIndex ? '0' : '-1'));
+    items[menuIndex].focus();
+  }
+  function openDemoMenu(at = 0) {
+    if (!ui.menu) return;
+    menuOpen = true;
+    ui.menu.hidden = false;
+    ui.demoBtn.setAttribute('aria-expanded', 'true');
+    focusMenuItem(at);
+  }
+  function closeDemoMenu(refocus = true) {
+    if (!ui.menu || !menuOpen) return;
+    menuOpen = false;
+    ui.menu.hidden = true;
+    ui.demoBtn.setAttribute('aria-expanded', 'false');
+    if (refocus) ui.demoBtn.focus();
+  }
+  function activateMenuItem(i) {
+    const it = menuItems()[i];
+    if (!it) return;
+    const action = it.getAttribute('data-action');
+    if (action === 'file') { closeDemoMenu(true); ui.fileInput?.click(); return; }
+    playBuiltIn(it.getAttribute('data-piece'));
+  }
 
   function userPress(source, midi, manual) {
-    if (demo.isPlaying()) demo.stop();
+    if (demo.stopsOnUserInput()) demo.stop(); // MIDI-file playback keeps running
     book.press(source, midi, manual);
   }
   const userRelease = (source, midi, manual) => book.release(source, midi, manual);
@@ -1446,6 +1622,8 @@ export function initInteraction(ctx) {
     if (mi >= 0) { e.preventDefault(); if (!e.repeat) setActiveManual(mi); return; }
     if (key === 'Escape') {
       if (ui.help && !ui.help.hidden) { toggleHelp(false); e.preventDefault(); return; }
+      if (menuOpen) { closeDemoMenu(); e.preventDefault(); return; }
+      if (demo.isPlaying()) { demo.stop(); e.preventDefault(); return; }
       e.preventDefault(); if (!e.repeat) pressPiston('general-cancel'); return;
     }
     if (key === 'Delete' || code === 'Delete') { e.preventDefault(); if (!e.repeat) pressPiston('general-cancel'); return; }
@@ -1947,9 +2125,95 @@ export function initInteraction(ctx) {
       bar.append(b);
     }
     bar.append(el('span', { class: 'rah-sep' }));
-    ui.demoBtn = el('button', { class: 'rah-btn', type: 'button', text: '▶ Demo', 'aria-pressed': 'false', title: 'J. S. Bach: Toccata d-Moll BWV 565 (Anfang)' });
-    ui.demoBtn.addEventListener('click', () => { audio.unlock(); if (!demo.isPlaying()) releaseUserNotes(); demo.toggle(); });
+    ui.demoBtn = el('button', { class: 'rah-btn rah-demo-btn', type: 'button', text: '▶ Demo', 'aria-pressed': 'false', 'aria-haspopup': 'menu', 'aria-expanded': 'false', 'aria-controls': 'rah-demo-menu', title: 'Demo-Stück wählen oder eigene MIDI-Datei spielen' });
+    let kbdAt = -1e9; // a handled Enter/Space keydown suppresses the browser's synthetic click
+    const demoBtnAction = (at) => {
+      audio.unlock();
+      if (demo.isPlaying()) { demo.stop(); return; }
+      if (menuOpen) closeDemoMenu(); else openDemoMenu(at);
+    };
+    ui.demoBtn.addEventListener('click', () => { if (perfNow() - kbdAt < 0.6) return; demoBtnAction(0); });
+    ui.demoBtn.addEventListener('keydown', (e) => {
+      const k = e.key;
+      if (k === 'Enter' || k === ' ' || k === 'Spacebar') { e.preventDefault(); e.stopPropagation(); if (e.repeat) return; kbdAt = perfNow(); demoBtnAction(0); }
+      else if ((k === 'ArrowDown' || k === 'ArrowUp') && !demo.isPlaying()) { e.preventDefault(); e.stopPropagation(); openDemoMenu(k === 'ArrowUp' ? -1 : 0); }
+    });
+    ui.demoBtn.addEventListener('keyup', (e) => { if (e.key === ' ' || e.key === 'Spacebar') e.preventDefault(); });
     bar.append(ui.demoBtn);
+
+    // demo menu (outside the bar, which scrolls and would clip it)
+    const menu = el('div', { class: 'rah-demo-menu rah-glass', id: 'rah-demo-menu', role: 'menu', 'aria-label': 'Demo wählen' });
+    menu.hidden = true;
+    ui.menuItems = [];
+    const item = (attrs, title, sub) => {
+      const it = el('div', { class: 'rah-mi', role: 'menuitem', tabindex: '-1', ...attrs }, [el('span', { class: 'rah-mi-t', text: title }), sub ? el('span', { class: 'rah-mi-s', text: sub }) : null]);
+      const idx = ui.menuItems.length;
+      it.addEventListener('click', () => activateMenuItem(idx));
+      it.addEventListener('pointermove', () => { if (menuIndex !== idx) focusMenuItem(idx); });
+      ui.menuItems.push(it);
+      return it;
+    };
+    menu.append(el('div', { class: 'rah-mh', text: 'Demo-Stücke' }));
+    for (const p of DEMO_PIECES) menu.append(item({ 'data-piece': p.id }, `▶ ${p.title}`, p.subtitle));
+    menu.append(el('div', { class: 'rah-msep', role: 'separator' }));
+    menu.append(item({ 'data-action': 'file' }, 'Eigene MIDI-Datei laden…', `.mid / .midi, auch per Ziehen & Ablegen · spielt mit deiner Registrierung · max. ${MIDI_MAX_SECONDS / 60} Minuten`));
+    menu.append(el('p', { class: 'rah-mnote', text: 'Die Datei bleibt auf deinem Gerät – nichts wird hochgeladen oder gespeichert.' }));
+    menu.addEventListener('keydown', (e) => {
+      const k = e.key;
+      const stop = () => { e.preventDefault(); e.stopPropagation(); };
+      if (k === 'ArrowDown') { stop(); focusMenuItem(menuIndex + 1); }
+      else if (k === 'ArrowUp') { stop(); focusMenuItem(menuIndex - 1); }
+      else if (k === 'Home') { stop(); focusMenuItem(0); }
+      else if (k === 'End') { stop(); focusMenuItem(-1); }
+      else if (k === 'Enter' || k === ' ' || k === 'Spacebar') { stop(); if (!e.repeat) activateMenuItem(menuIndex); }
+      else if (k === 'Escape') { stop(); closeDemoMenu(); }
+      else if (k === 'Tab') closeDemoMenu(false);
+      else if (!e.ctrlKey && !e.metaKey && !e.altKey) e.stopPropagation(); // no notes / pistons while the menu has focus
+    });
+    ui.menu = menu;
+    root.append(menu);
+    window.addEventListener('pointerdown', (e) => {
+      if (!menuOpen) return;
+      const t = e.target;
+      if (menu.contains?.(t) || ui.demoBtn.contains?.(t)) return;
+      closeDemoMenu(false);
+    }, { capture: true });
+
+    // hidden file input
+    const fileInput = el('input', { type: 'file', accept: '.mid,.midi,audio/midi,audio/x-midi', class: 'rah-sr', tabindex: '-1', 'aria-hidden': 'true' });
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files && fileInput.files[0];
+      fileInput.value = '';
+      playMidiFile(f);
+    });
+    ui.fileInput = fileInput;
+    root.append(fileInput);
+
+    // now playing
+    ui.nowTitle = el('b', { class: 'rah-now-t' });
+    ui.nowTime = el('span', { class: 'rah-now-time' });
+    ui.nowFill = el('span', { class: 'rah-now-fill' });
+    ui.nowBar = el('span', { class: 'rah-now-bar', role: 'progressbar', 'aria-label': 'Fortschritt', 'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': '0' }, [ui.nowFill]);
+    ui.nowNote = el('span', { class: 'rah-now-note' });
+    ui.now = el('div', { class: 'rah-now rah-glass', role: 'status', 'aria-live': 'polite' }, [el('span', { class: 'rah-now-h' }, [ui.nowTitle, ui.nowTime]), ui.nowBar, ui.nowNote]);
+    ui.now.hidden = true;
+    root.append(ui.now);
+
+    // drag & drop of a MIDI file anywhere on the page
+    ui.drop = el('div', { class: 'rah-drop', 'aria-hidden': 'true' }, [el('div', { class: 'rah-drop-box' }, [el('b', { text: 'MIDI-Datei hier ablegen' }), el('span', { text: 'Sie wird auf der Orgel gespielt und bleibt auf deinem Gerät.' })])]);
+    ui.drop.hidden = true;
+    root.append(ui.drop);
+    let dragDepth = 0;
+    const hasFiles = (e) => { const ty = e.dataTransfer && e.dataTransfer.types; return !!ty && [...ty].includes('Files'); };
+    window.addEventListener('dragenter', (e) => { if (!hasFiles(e)) return; e.preventDefault(); dragDepth++; ui.drop.hidden = false; });
+    window.addEventListener('dragover', (e) => { if (!hasFiles(e)) return; e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'; ui.drop.hidden = false; });
+    window.addEventListener('dragleave', (e) => { if (!hasFiles(e)) return; dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) ui.drop.hidden = true; });
+    window.addEventListener('drop', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      dragDepth = 0; ui.drop.hidden = true;
+      playMidiFile(e.dataTransfer.files && e.dataTransfer.files[0]);
+    });
     ui.helpBtn = el('button', { class: 'rah-btn', type: 'button', text: 'Hilfe', 'aria-expanded': 'false', 'aria-controls': 'rah-help', title: 'Hilfe (?)' });
     ui.helpBtn.addEventListener('click', () => toggleHelp());
     bar.append(ui.helpBtn);
@@ -1980,6 +2244,7 @@ export function initInteraction(ctx) {
     tremulants: () => TREMULANT_IDS.filter((id) => reg.tremulants.has(id)),
     swell: (id) => swell.get(id),
     goToPreset,
+    playBuiltIn, playMidiBytes, playMidiFile, openDemoMenu, closeDemoMenu, isDemoMenuOpen: () => menuOpen,
     allNotesOff() { demo.stop(); panic(); audio.allNotesOff(); tracker.releaseAll(); },
   };
 }
