@@ -934,6 +934,7 @@ export function buildCase(ctx) {
     mesh.name = `case_${key}`;
     mesh.castShadow = !(key === 'grilleL' || key === 'grilleB' || key === 'gauze');
     mesh.receiveShadow = true;
+    mesh.matrixAutoUpdate = false;     // static (vertices are in group space)
     triangles += P.count / 3;
     group.add(mesh);
   }

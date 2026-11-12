@@ -2,8 +2,10 @@
 // choir tiers, stage, the curved hall wall with box tiers and gallery arcade,
 // and a hint of the ceiling with the acoustic "mushrooms".
 //
-// Everything is static. Geometry is merged per material; repeated elements are
-// InstancedMeshes. Nothing enters LAYOUT.reserved (the organ + console volume).
+// Everything is static. Geometry is merged per material (small repeated
+// elements are baked into it); large repeated sets (seats, balusters) are
+// InstancedMeshes. Only geometry inside the key light's cone casts shadows.
+// Nothing enters LAYOUT.reserved (the organ + console volume).
 //
 // Mood: the organ is the lit subject; the hall sits in warm, dim light. All hall
 // surfaces carry a baked light falloff (vertex colours on merged meshes,
@@ -353,9 +355,9 @@ function roundRect(w, h, r) {
 }
 
 // rounded, bevelled cushion centred on the origin, thickness along z
-function cushion(w, h, depth, r, bevel) {
+function cushion(w, h, depth, r, bevel, bevelSegments = 2, curveSegments = 3) {
   const g = new THREE.ExtrudeGeometry(roundRect(w - 2 * bevel, h - 2 * bevel, r), {
-    depth, bevelEnabled: bevel > 0, bevelThickness: bevel, bevelSize: bevel, bevelSegments: 2, curveSegments: 3,
+    depth, bevelEnabled: bevel > 0, bevelThickness: bevel, bevelSize: bevel, bevelSegments, curveSegments,
   });
   g.translate(0, 0, -depth / 2);
   return g;
@@ -389,12 +391,64 @@ function flutedShaft(w, d, flutes) {
 const nonIdx = (g) => (g.index ? g.toNonIndexed() : g);
 const mergeAny = (list) => mergeGeometries(list.map(nonIdx));
 
+// LOD switched by the distance from the camera to the nearest point of a box
+// (THREE.LOD measures to its origin). The renderer calls update(camera).
+const _lodV = new V3(), _lodB = new THREE.Box3();
+class BoxLOD extends THREE.LOD {
+  constructor(box) { super(); this.box = box; }
+  update(camera) {
+    const levels = this.levels;
+    if (levels.length < 2) return;
+    _lodV.setFromMatrixPosition(camera.matrixWorld);
+    _lodB.copy(this.box).applyMatrix4(this.matrixWorld);
+    const d = _lodB.distanceToPoint(_lodV) / (camera.zoom || 1);
+    let cur = 0;
+    for (let i = 1; i < levels.length; i++) if (d >= levels[i].distance) cur = i;
+    for (let i = 0; i < levels.length; i++) levels[i].object.visible = i === cur;
+    this._currentLevel = cur;
+  }
+}
+
+// The shadow-casting key light (main.js: SpotLight at (6, 30, 30) aimed at
+// (0, 9, 0), angle 0.36). Only geometry inside its cone can cast a visible
+// shadow (an occluder outside the cone shadows only unlit space), so hall
+// geometry outside the cone does not cast. Read from ctx.scene when the light
+// is already there, else main.js's values.
+const CONE_MARGIN = 0.05;   // rad of slack around the cone
+function keyLightCone(scene) {
+  let L = null;
+  scene?.traverse?.((o) => { if (!L && o.isSpotLight && o.castShadow) L = o; });
+  if (L) {
+    L.updateWorldMatrix(true, false); L.target.updateWorldMatrix(true, false);
+    const pos = new V3().setFromMatrixPosition(L.matrixWorld), tgt = new V3().setFromMatrixPosition(L.target.matrixWorld);
+    return { pos, dir: tgt.sub(pos).normalize(), angle: L.angle, range: L.distance || Infinity };
+  }
+  const pos = new V3(6, 30, 30);
+  return { pos, dir: new V3(0, 9, 0).sub(pos).normalize(), angle: 0.36, range: 90 };
+}
+
 // =====================================================================
 export function buildHall(ctx) {
   const M = ctx.materials;
   const L = ctx.LAYOUT;
   const group = new THREE.Group();
   group.name = 'hall';
+  const KEY = keyLightCone(ctx.scene);
+  const _cv = new V3();
+  // can a sphere (centre c, radius r) receive / cast the key light's shadow?
+  const inCone = (c, r = 0) => {
+    _cv.subVectors(c, KEY.pos);
+    const d = _cv.length();
+    if (d <= r) return true;
+    if (d - r > KEY.range) return false;
+    const a = Math.acos(THREE.MathUtils.clamp(_cv.dot(KEY.dir) / d, -1, 1)) - Math.asin(Math.min(1, r / d));
+    return a < KEY.angle + CONE_MARGIN;
+  };
+  const geoInCone = (g) => {
+    const p = g.attributes.position, v = new V3();
+    for (let i = 0; i < p.count; i++) if (inCone(v.fromBufferAttribute(p, i))) return true;
+    return false;
+  };
 
   // ---------- plan-curve sampling ----------
   const CT = buildCurveTable();
@@ -509,13 +563,16 @@ export function buildHall(ctx) {
 
   // ---------- merge buckets ----------
   const buckets = new Map();
-  function add(key, g, shadow = 'r') {
+  // keepColor: g carries its own (baked instance) colours
+  function add(key, g, shadow = 'r', keepColor = false) {
     baseMat(key);
     if (g.index) { const ng = g.toNonIndexed(); g.dispose(); g = ng; }
     if (!g.attributes.normal) g.computeVertexNormals();
     if (!g.attributes.uv) g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(g.attributes.position.count * 2), 2));
-    for (const name of Object.keys(g.attributes)) if (!['position', 'normal', 'uv'].includes(name)) g.deleteAttribute(name);
+    const keep = keepColor ? ['position', 'normal', 'uv', 'color'] : ['position', 'normal', 'uv'];
+    for (const name of Object.keys(g.attributes)) if (!keep.includes(name)) g.deleteAttribute(name);
     g.clearGroups();
+    if (shadow === 'rc' && !geoInCone(g)) shadow = 'r';
     const id = key + '|' + shadow;
     if (!buckets.has(id)) buckets.set(id, { key, shadow, list: [] });
     buckets.get(id).list.push(g);
@@ -523,25 +580,93 @@ export function buildHall(ctx) {
 
   const instanced = [];
   const tmpC = new THREE.Color();
-  function addInstanced(name, geo, key, matrices, { cast = false, receive = true, lit = true, jitter = 0, seed = 7 } = {}) {
+  // Repeated elements. Instance colours = baked falloff at the instance origin
+  // (with optional jitter). bake: the instances are baked into the merged
+  // per-material mesh instead (vertex colours = those instance colours), one
+  // draw call less, same pixels. Casting instanced meshes put the instances
+  // inside the key light's cone first and draw only those in the shadow pass.
+  // lod: { geo, distance } reduced geometry used beyond `distance` from the set.
+  // blocks(x, y, z) -> key: split into separately culled sets (e.g. the seats
+  // behind a camera at the console).
+  function addInstanced(name, geo, key, matrices, { cast = false, receive = true, lit = true, jitter = 0, seed = 7, bake = false, lod = null, blocks = null } = {}) {
     if (!matrices.length) return null;
-    const im = new THREE.InstancedMesh(geo, baseMat(key), matrices.length);
-    im.name = 'hall_' + name;
     const r = rng(seed);
-    matrices.forEach((m, i) => {
-      im.setMatrixAt(i, m);
-      if (lit) {
-        const e = m.elements;
-        const f = shade(e[12], e[13], e[14]) * (1 - jitter * r());
-        im.setColorAt(i, warm(f, tmpC));
-      }
+    const colors = matrices.map((m) => {
+      if (!lit) return null;
+      const e = m.elements;
+      return warm(shade(e[12], e[13], e[14]) * (1 - jitter * r()), new THREE.Color());
     });
-    im.instanceMatrix.needsUpdate = true;
-    if (im.instanceColor) im.instanceColor.needsUpdate = true;
-    im.castShadow = cast; im.receiveShadow = receive;
-    im.computeBoundingBox(); im.computeBoundingSphere();
-    group.add(im);
+    if (bake) {
+      const mode = cast && receive ? 'rc' : receive ? 'r' : 'n';
+      matrices.forEach((m, i) => {
+        const g = nonIdx(geo.clone());
+        g.applyMatrix4(m);
+        const n = g.attributes.position.count, col = new Float32Array(n * 3), c = colors[i];
+        for (let k = 0; k < n; k++) { col[k * 3] = c ? c.r : 1; col[k * 3 + 1] = c ? c.g : 1; col[k * 3 + 2] = c ? c.b : 1; }
+        g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+        add(key, g, mode, true);
+      });
+      geo.dispose();
+      return null;
+    }
+    // optional spatial blocks (separately frustum-culled)
+    const blockOf = blocks ? matrices.map((m) => blocks(m.elements[12], m.elements[13], m.elements[14])) : matrices.map(() => 0);
+    const keys = [...new Set(blockOf)];
+    let first = null;
+    for (const bk of keys) {
+      const sel = matrices.map((_, i) => i).filter((i) => blockOf[i] === bk);
+      const im = instancedSet(name + (keys.length > 1 ? ':' + bk : ''), geo, key, sel.map((i) => matrices[i]), sel.map((i) => colors[i]), cast, receive, lod);
+      first ||= im;
+    }
+    return first;
+  }
+  function instancedSet(name, geo, key, matrices, colors, cast, receive, lod) {
+    let order = matrices.map((_, i) => i), nCast = 0;
+    if (cast) {
+      if (!geo.boundingSphere) geo.computeBoundingSphere();
+      const sp = new THREE.Sphere();
+      const inside = matrices.map((m) => { sp.copy(geo.boundingSphere).applyMatrix4(m); return inCone(sp.center, sp.radius); });
+      order = [...order.filter((i) => inside[i]), ...order.filter((i) => !inside[i])];
+      nCast = inside.filter(Boolean).length;
+    }
+    const make = (g, nm) => {
+      const im = new THREE.InstancedMesh(g, baseMat(key), matrices.length);
+      im.name = nm;
+      order.forEach((src, i) => { im.setMatrixAt(i, matrices[src]); if (colors[src]) im.setColorAt(i, colors[src]); });
+      im.instanceMatrix.needsUpdate = true;
+      if (im.instanceColor) im.instanceColor.needsUpdate = true;
+      im.castShadow = cast && nCast > 0; im.receiveShadow = receive;
+      if (im.castShadow && nCast < matrices.length) {
+        let full = 0;
+        im.onBeforeShadow = function () { full = this.count; this.count = nCast; };
+        im.onAfterShadow = function () { this.count = full; };
+      }
+      im.computeBoundingBox();
+      im.boundingSphere = im.boundingBox.getBoundingSphere(new THREE.Sphere());
+      im.matrixAutoUpdate = false;
+      return im;
+    };
+    const im = make(geo, 'hall_' + name);
     instanced.push(im);
+    if (!lod) { group.add(im); return im; }
+    const fm = make(lod.geo, 'hall_' + name + 'Far');
+    fm.instanceMatrix = im.instanceMatrix;
+    if (im.instanceColor) fm.instanceColor = im.instanceColor;
+    // the levels are Groups: the LOD switches their visibility, so a mesh hidden
+    // from outside (interaction.js' Technik-Modus hides hall meshes) stays hidden
+    const lo = new BoxLOD(im.boundingBox.clone());
+    lo.name = 'hall_' + name + 'LOD';
+    [im, fm].forEach((m, i) => {
+      const lg = new THREE.Group();
+      lg.name = m.name + 'Level';
+      lg.add(m);
+      lg.visible = i === 0;
+      lg.matrixAutoUpdate = false;
+      lo.addLevel(lg, i ? lod.distance : 0);
+    });
+    lo.matrixAutoUpdate = false;
+    group.add(lo);
+    instanced.push(fm);
     return im;
   }
 
@@ -735,20 +860,27 @@ export function buildHall(ctx) {
 
   // --- seats: tip-up, rounded velvet cushions in a dark curved shell ---
   const RECLINE = -0.1;
-  const shell = new THREE.ExtrudeGeometry(roundRect(0.48, 0.6, 0.06), { depth: 0.025, bevelEnabled: false, curveSegments: 3 });
-  shell.translate(0, 0, -0.0125); bend(shell, 0.04, 0.24); shell.rotateX(RECLINE); shell.translate(0, 0.64, 0.03);
-  const seatFrameGeo = mergeAny([
-    box(0.04, 0.62, 0.42, -0.25, 0.31, 0.23),
-    box(0.04, 0.62, 0.42, 0.25, 0.31, 0.23),
-    box(0.065, 0.035, 0.4, -0.25, 0.637, 0.24),
-    box(0.065, 0.035, 0.4, 0.25, 0.637, 0.24),
-    shell,
-  ]);
-  const back = cushion(0.42, 0.47, 0.03, 0.06, 0.022);
-  bend(back, 0.035, 0.21); back.rotateX(RECLINE); back.translate(0, 0.665, 0.072);
-  const seat = cushion(0.42, 0.4, 0.04, 0.06, 0.022);
-  seat.rotateX(0.2); seat.translate(0, 0.55, 0.175);
-  const seatUphGeo = mergeAny([back, seat]);
+  // q = 0: full model; q = 1: reduced model beyond SEAT_LOD_DIST (1-segment
+  // bevels, 2 segments per corner: < 1 device pixel of difference from there)
+  const seatGeos = (q) => {
+    const shell = new THREE.ExtrudeGeometry(roundRect(0.48, 0.6, 0.06), { depth: 0.025, bevelEnabled: false, curveSegments: q ? 2 : 3 });
+    shell.translate(0, 0, -0.0125); bend(shell, 0.04, 0.24); shell.rotateX(RECLINE); shell.translate(0, 0.64, 0.03);
+    const frame = mergeAny([
+      box(0.04, 0.62, 0.42, -0.25, 0.31, 0.23),
+      box(0.04, 0.62, 0.42, 0.25, 0.31, 0.23),
+      box(0.065, 0.035, 0.4, -0.25, 0.637, 0.24),
+      box(0.065, 0.035, 0.4, 0.25, 0.637, 0.24),
+      shell,
+    ]);
+    const back = cushion(0.42, 0.47, 0.03, 0.06, 0.022, q ? 1 : 2, q ? 2 : 3);
+    bend(back, 0.035, 0.21); back.rotateX(RECLINE); back.translate(0, 0.665, 0.072);
+    const seat = cushion(0.42, 0.4, 0.04, 0.06, 0.022, q ? 1 : 2, q ? 2 : 3);
+    seat.rotateX(0.2); seat.translate(0, 0.55, 0.175);
+    return { frame, uph: mergeAny([back, seat]) };
+  };
+  const SEAT_LOD_DIST = 15;
+  const { frame: seatFrameGeo, uph: seatUphGeo } = seatGeos(0);
+  const { frame: seatFrameFar, uph: seatUphFar } = seatGeos(1);
   const plateGeo = new THREE.BoxGeometry(0.07, 0.028, 0.006);
   plateGeo.rotateX(RECLINE); plateGeo.translate(0, 0.86, -0.006);
 
@@ -781,9 +913,10 @@ export function buildHall(ctx) {
       }
     }
   }
-  addInstanced('seatFrames', seatFrameGeo, 'seatFrame', seatM, { cast: true });
-  addInstanced('seatUpholstery', seatUphGeo, 'redVelvet', seatM, { cast: true, jitter: 0.12, seed: 31 });
-  addInstanced('seatPlates', plateGeo, 'brass', seatM);
+  const seatBlocks = (x) => (x < 0 ? 'L' : 'R');      // left / right halves (culled behind a camera at the console)
+  addInstanced('seatFrames', seatFrameGeo, 'seatFrame', seatM, { cast: true, lod: { geo: seatFrameFar, distance: SEAT_LOD_DIST }, blocks: seatBlocks });
+  addInstanced('seatUpholstery', seatUphGeo, 'redVelvet', seatM, { cast: true, jitter: 0.12, seed: 31, lod: { geo: seatUphFar, distance: SEAT_LOD_DIST }, blocks: seatBlocks });
+  addInstanced('seatPlates', plateGeo, 'brass', seatM, { bake: true });
 
   // --- brass hoop handrails at the row ends along the central aisle ---
   {
@@ -797,7 +930,7 @@ export function buildHall(ctx) {
       const x = sg * (C_HW + 0.02);
       ms.push(new THREE.Matrix4().makeTranslation(x, -k * DROP, rz(k - 1, x) + 0.1));
     }
-    addInstanced('aisleHoops', hoopGeo, 'brass', ms, { cast: true });
+    addInstanced('aisleHoops', hoopGeo, 'brass', ms, { cast: true, bake: true });
   }
 
   // =================================================================
@@ -828,7 +961,7 @@ export function buildHall(ctx) {
     }
     const prof = [[0.03, 0], [0.046, 0.05], [0.024, 0.12], [0.05, 0.3], [0.032, 0.5], [0.022, 0.62], [0.036, 0.7], [0.03, 0.78]]
       .map(([r, y]) => new THREE.Vector2(r, y));
-    addInstanced('balusters', new THREE.LatheGeometry(prof, 8), 'oak', balM, { cast: true });
+    addInstanced('balusters', new THREE.LatheGeometry(prof, 8), 'oak', balM, { cast: true, blocks: (x) => (x < 0 ? 'L' : 'R') });
 
     // panelled wall under the gallery front, left and right of the choir
     for (const sg of [-1, 1]) {
@@ -917,8 +1050,8 @@ export function buildHall(ctx) {
       }
     }
     standM.push(new THREE.Matrix4().makeRotationY(0).setPosition(0, stageY + 0.22, cz - 0.5));
-    addInstanced('orchChairs', chairGeo, 'black', chairM, { cast: true });
-    addInstanced('musicStands', standGeo, 'black', standM, { cast: true });
+    addInstanced('orchChairs', chairGeo, 'black', chairM, { cast: true, bake: true });
+    addInstanced('musicStands', standGeo, 'black', standM, { cast: true, bake: true });
     addInstanced('musicSheets', sheet, 'paper', standM);
   }
 
@@ -962,7 +1095,11 @@ export function buildHall(ctx) {
   sweep('gold', -S, S, [[0.825, 25.35], [0.825, 25.43]]);
   {
     // dentils under both cornices
+    // the back (against the band) and top (under the soffit) faces are never visible
     const dent = new THREE.BoxGeometry(0.1, 0.15, 0.14).translate(0, 0, 0.07);
+    { const keepIdx = [], I = dent.index.array;
+      for (const gr of dent.groups) if (gr.materialIndex !== 2 && gr.materialIndex !== 5) for (let i = gr.start; i < gr.start + gr.count; i++) keepIdx.push(I[i]);
+      dent.setIndex(keepIdx); dent.clearGroups(); }
     const dm = [];
     const n = Math.floor((2 * S) / 0.25);
     for (let i = 0; i < n; i++) {
@@ -970,7 +1107,7 @@ export function buildHall(ctx) {
       dm.push(frame(s, 0.22, 16.13));
       dm.push(frame(s, 0.4, 24.99));
     }
-    addInstanced('dentils', dent, 'plaster', dm);
+    addInstanced('dentils', dent, 'plaster', dm, { bake: true });
   }
 
   // --- gallery arcade ---
@@ -1019,9 +1156,9 @@ export function buildHall(ctx) {
       pierM.push(frame(s, 0.07, (Y_SILL + Y_SPRING) / 2));
       capM.push(frame(s, 0.1, Y_SPRING + 0.1));
     }
-    addInstanced('arcadePiers', new THREE.BoxGeometry(0.44, Y_SPRING - Y_SILL, 0.14), 'plaster', pierM);
-    addInstanced('arcadeCapitals', new THREE.BoxGeometry(0.56, 0.2, 0.2), 'goldMatte', capM);
-    addInstanced('archivolts', new THREE.TorusGeometry(RAD + 0.08, 0.07, 6, 18, Math.PI), 'plaster', archM);
+    addInstanced('arcadePiers', new THREE.BoxGeometry(0.44, Y_SPRING - Y_SILL, 0.14), 'plaster', pierM, { bake: true });
+    addInstanced('arcadeCapitals', new THREE.BoxGeometry(0.56, 0.2, 0.2), 'goldMatte', capM, { bake: true });
+    addInstanced('archivolts', new THREE.TorusGeometry(RAD + 0.08, 0.07, 6, 18, Math.PI), 'plaster', archM, { bake: true });
   }
 
   // --- fluted pilasters (organ wall and box-block end walls) ---
@@ -1121,8 +1258,8 @@ export function buildHall(ctx) {
     put('goldMatte', new THREE.BoxGeometry(EW, 0.04, 0.15), EW / 2, 10.66, 0.075);
     pilaster(endFrame(D - 0.38, 0, 0), 0, 10.57);
   }
-  addInstanced('boxPartitions', new THREE.BoxGeometry(0.14, 1, 1.8), 'plaster', partM);
-  addInstanced('boxLamps', new THREE.SphereGeometry(0.075, 10, 7), 'lamp', lampM, { receive: false, lit: false });
+  addInstanced('boxPartitions', new THREE.BoxGeometry(0.14, 1, 1.8), 'plaster', partM, { bake: true });
+  addInstanced('boxLamps', new THREE.SphereGeometry(0.075, 10, 7), 'lamp', lampM, { receive: false, lit: false, bake: true });
 
   // pilaster instanced meshes
   {
@@ -1150,10 +1287,10 @@ export function buildHall(ctx) {
       ...leaves, vol(-0.37), vol(0.37),
       box(PIL_W + 0.3, 0.03, PIL_D + 0.17, 0, 0.6, (PIL_D + 0.17) / 2), // abacus fillet
     ]);
-    addInstanced('pilasterShafts', flutedShaft(PIL_W, PIL_D, 7), 'plaster', pilShaftM);
-    addInstanced('pilasterBases', baseGeo, 'plaster', pilBaseM);
-    addInstanced('pilasterCapitals', capPGeo, 'plaster', pilCapM);
-    addInstanced('pilasterGilding', capGGeo, 'goldMatte', pilCapM);
+    addInstanced('pilasterShafts', flutedShaft(PIL_W, PIL_D, 7), 'plaster', pilShaftM, { bake: true });
+    addInstanced('pilasterBases', baseGeo, 'plaster', pilBaseM, { bake: true });
+    addInstanced('pilasterCapitals', capPGeo, 'plaster', pilCapM, { bake: true });
+    addInstanced('pilasterGilding', capGGeo, 'goldMatte', pilCapM, { bake: true });
   }
 
   // --- drapes (arcade, boxes, organ wall): tied-back curtains with a valance ---
@@ -1181,7 +1318,7 @@ export function buildHall(ctx) {
     const drapeGeo = mergeGeometries([gridGeo(rowsL), gridGeo(rowsR), gridGeo([bot, top])]);
     drapeGeo.translate(-W / 2, 0, 0);
     drapeGeo.scale(1 / W, 1 / H, 1);
-    addInstanced('drapes', drapeGeo, 'redVelvet', drapeM, { jitter: 0.1, seed: 5 });
+    addInstanced('drapes', drapeGeo, 'redVelvet', drapeM, { jitter: 0.1, seed: 5, bake: true });
   }
 
   // =================================================================
@@ -1311,7 +1448,7 @@ export function buildHall(ctx) {
       const x = -11 + 2 * i;
       headM.push(new THREE.Matrix4().makeRotationY((rr() - 0.5) * 1.2).setPosition(x, r.yc - 0.15, r.z));
     }
-    addInstanced('movingHeads', headGeo, 'fixture', headM, { receive: false });
+    addInstanced('movingHeads', headGeo, 'fixture', headM, { receive: false, bake: true });
     addInstanced('movingHeadLenses', lensGeo, 'lens', headM, { receive: false, lit: false });
     RIG.heads = headM.length;
 
@@ -1325,8 +1462,8 @@ export function buildHall(ctx) {
     const lampAt = (x, r) => lampCM.push(new THREE.Matrix4().makeRotationX(0.35).setPosition(x, r.yc - 0.15, r.z + 0.02));
     for (const x of [-8, -4, 4, 8]) lampAt(x, rows[0]);
     for (const r of rows.slice(1)) for (const x of [-10, -6, -2, 2, 6, 10]) lampAt(x, r);
-    addInstanced('lampHousings', housingGeo, 'fixture', lampCM, { receive: false });
-    addInstanced('lampBulbs', bulbGeo, 'lamp', lampCM, { receive: false, lit: false });
+    addInstanced('lampHousings', housingGeo, 'fixture', lampCM, { receive: false, bake: true });
+    addInstanced('lampBulbs', bulbGeo, 'lamp', lampCM, { receive: false, lit: false, bake: true });
     RIG.lampClusters = lampCM.length;
 
     // line arrays: J-curved stacks of cabinets (front at local z = 0)
@@ -1358,20 +1495,24 @@ export function buildHall(ctx) {
   // 7. Flush buckets -> one mesh per material, with baked falloff colours
   // =================================================================
   for (const { key, shadow, list } of buckets.values()) {
+    for (const l of list) {
+      if (l.attributes.color) continue;          // baked instances carry their colours
+      const p = l.attributes.position;
+      const col = new Float32Array(p.count * 3);
+      for (let i = 0; i < p.count; i++) {
+        warm(shade(p.getX(i), p.getY(i), p.getZ(i)), tmpC);
+        col[i * 3] = tmpC.r; col[i * 3 + 1] = tmpC.g; col[i * 3 + 2] = tmpC.b;
+      }
+      l.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    }
     const g = mergeGeometries(list, false);
     for (const l of list) l.dispose();
-    const p = g.attributes.position;
-    const col = new Float32Array(p.count * 3);
-    for (let i = 0; i < p.count; i++) {
-      warm(shade(p.getX(i), p.getY(i), p.getZ(i)), tmpC);
-      col[i * 3] = tmpC.r; col[i * 3 + 1] = tmpC.g; col[i * 3 + 2] = tmpC.b;
-    }
-    g.setAttribute('color', new THREE.BufferAttribute(col, 3));
     g.computeBoundingBox(); g.computeBoundingSphere();
     const mesh = new THREE.Mesh(g, vcMat(key));
     mesh.name = 'hall_' + key + (shadow === 'rc' ? '_cast' : '');
     mesh.receiveShadow = shadow !== 'n';
     mesh.castShadow = shadow === 'rc';
+    mesh.matrixAutoUpdate = false;
     group.add(mesh);
   }
 
@@ -1383,6 +1524,7 @@ export function buildHall(ctx) {
     pl.position.set(sx * 12, 5, 21);
     pl.castShadow = false;
     pl.name = 'hall_ambience';
+    pl.matrixAutoUpdate = false; pl.updateMatrix();
     group.add(pl);
   }
 

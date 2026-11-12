@@ -2,9 +2,10 @@
 // from the stop list. The facade pipes (LAYOUT.sections: free-standing big
 // Pedal Open Diapason II / Double Open Diapason pipes in 'cluster' sections,
 // Great Open Diapason 1 / 2 trebles in a V inside the three 'arch' recesses)
-// are individual meshes in plain silver metal with flattened, slightly
-// brighter bay-leaf lips; they ARE those notes of their ranks. The interior
-// stands on divisional chests (instanced) behind the facade, clear of the arch
+// are individual pipes (proxy meshes, drawn merged per section kind) in plain
+// silver metal with flattened, slightly brighter bay-leaf lips; they ARE those
+// notes of their ranks. The interior stands on divisional chests (instanced,
+// with distance levels of detail) behind the facade, clear of the arch
 // recesses. Note glow / registration tint / hover highlight are driven by the
 // event bus.
 import * as THREE from 'three';
@@ -210,6 +211,66 @@ function buildFluePipe({ r, len, foot, nb }, dark) {
   metal.shade = 1;
 
   return metal.finish();
+}
+
+// Merge facade pipe geometries (indexed; position, normal, uv, color) baked
+// with their matrices; aPipe = index of the pipe within the merged mesh.
+function mergeFacade(parts) {
+  let nv = 0, ni = 0;
+  for (const { geo } of parts) { nv += geo.attributes.position.count; ni += geo.index.count; }
+  const pos = new Float32Array(nv * 3), nor = new Float32Array(nv * 3), uv = new Float32Array(nv * 2), col = new Float32Array(nv * 3);
+  const pid = new Float32Array(nv), idx = new Uint32Array(ni);
+  const v = new THREE.Vector3(), nm = new THREE.Matrix3();
+  let ov = 0, oi = 0;
+  parts.forEach(({ geo, matrix }, k) => {
+    const P = geo.attributes.position, N = geo.attributes.normal, n = P.count;
+    nm.getNormalMatrix(matrix);
+    for (let i = 0; i < n; i++) {
+      v.fromBufferAttribute(P, i).applyMatrix4(matrix); pos.set([v.x, v.y, v.z], (ov + i) * 3);
+      v.fromBufferAttribute(N, i).applyMatrix3(nm).normalize(); nor.set([v.x, v.y, v.z], (ov + i) * 3);
+      pid[ov + i] = k;
+    }
+    uv.set(geo.attributes.uv.array, ov * 2);
+    col.set(geo.attributes.color.array, ov * 3);
+    const I = geo.index.array;
+    for (let i = 0; i < I.length; i++) idx[oi + i] = I[i] + ov;
+    ov += n; oi += I.length;
+  });
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.setAttribute('aPipe', new THREE.BufferAttribute(pid, 1));
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  g.computeBoundingBox();
+  g.computeBoundingSphere();
+  return g;
+}
+
+// Material of a merged facade mesh: the per-pipe material (proto) without its
+// own glow; per pipe vec4 uFacade[i] = (emissive radiance rgb, colour factor).
+function facadeMaterial(proto, n, kind) {
+  const m = proto.clone();
+  m.name = 'pipeMetal';
+  m.visible = true;
+  m.emissive.set(0x000000);
+  m.emissiveIntensity = 1;
+  const state = Array.from({ length: n }, () => new THREE.Vector4(0, 0, 0, 1));
+  const uFacade = { value: state };
+  m.userData.state = state;
+  m.onBeforeCompile = (sh) => {
+    sh.uniforms.uFacade = uFacade;
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', `#include <common>\nattribute float aPipe;\nuniform vec4 uFacade[${n}];\nvarying vec4 vFacade;`)
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvFacade = uFacade[int(aPipe + 0.5)];');
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying vec4 vFacade;')
+      .replace('#include <color_fragment>', '#include <color_fragment>\ndiffuseColor.rgb *= vFacade.w;')
+      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += vFacade.rgb;');
+  };
+  m.customProgramCacheKey = () => 'facadePipes' + kind + n;
+  return m;
 }
 
 // ---------------------------------------------------------------------------
@@ -702,24 +763,64 @@ function glowMaterial(base, name, tweak = {}) {
   return m;
 }
 
-// unit geometries (y from 0 to 1, radius 1)
-function unitGeometries() {
+// unit geometries (y from 0 to 1, radius 1) per level of detail: level 0 is
+// the full model; levels 1, 2 (camera at least LOD_DIST[i] from every interior
+// pipe) use fewer radial segments, chosen so that the silhouette error of the
+// largest pipe of each size class stays <= ~1 device pixel at a 2x pixel ratio
+// (r * (1 - cos(PI / n)) * 2000 px / distance). Round parts only; boxes and
+// mouth planes have a single level.
+const LOD_SEGS = [{ s: 6, m: 10, l: 16 }, { s: 4, m: 6, l: 12 }, { s: 3, m: 5, l: 8 }];
+const LOD_DIST = [0, 20, 32];
+// level-0 culling groups (chest id -> group; other chests: 'rest')
+const LOD_GROUPS = { great: 'great', swell: 'swell', solo: 'solo' };
+function unitGeometries(level = 0) {
   const tube = (rt, rb, seg, open = true) => new THREE.CylinderGeometry(rt, rb, 1, seg, 1, open).translate(0, 0.5, 0);
+  // reed boots stand on the chest: no bottom disc (never visible)
+  const boot = (seg) => {
+    const g = tube(1, 1, seg, false);
+    const bottom = g.groups.find((gr) => gr.materialIndex === 2);
+    g.setIndex(Array.from(g.index.array.slice(0, bottom.start)));
+    g.clearGroups();
+    return g;
+  };
   const G = {};
-  const segs = { s: 6, m: 10, l: 16 };
+  const segs = LOD_SEGS[level];
   for (const [k, n] of Object.entries(segs)) {
     G['body-' + k] = () => tube(1, 1, n);
     G['foot-' + k] = () => tube(1, 0.25, n);
     G['cone-' + k] = () => tube(1, 0.15, n);
     G['cap-' + k] = () => tube(1, 1, n, false);
   }
-  G['boot-s'] = () => tube(1, 1, 6, false);
-  G['boot-m'] = () => tube(1, 1, 10, false);
-  G.box = () => new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0);
-  G.mouth = () => new THREE.PlaneGeometry(1, 1);
+  G['boot-s'] = () => boot(segs.s);
+  G['boot-m'] = () => boot(segs.m);
+  if (level === 0) {
+    G.box = () => new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0);
+    G.mouth = () => new THREE.PlaneGeometry(1, 1);
+  }
   return G;
 }
 const lod = (d) => (d < 0.03 ? 's' : d < 0.12 ? 'm' : 'l');
+// closed solids (stopper caps; boots, open only at the hidden bottom): no back faces
+const isClosedPart = (geo) => geo.startsWith('cap-') || geo.startsWith('boot-');
+
+// LOD switched by the distance from the camera to the nearest point of a box
+// (THREE.LOD measures to its origin, which is meaningless for a 20 m chamber).
+// The renderer calls update(camera) for every LOD it traverses.
+const _lodV = new THREE.Vector3(), _lodB = new THREE.Box3();
+class BoxLOD extends THREE.LOD {
+  constructor(box) { super(); this.box = box; }
+  update(camera) {
+    const levels = this.levels;
+    if (levels.length < 2) return;
+    _lodV.setFromMatrixPosition(camera.matrixWorld);
+    _lodB.copy(this.box).applyMatrix4(this.matrixWorld);
+    const d = _lodB.distanceToPoint(_lodV) / (camera.zoom || 1);
+    let cur = 0;
+    for (let i = 1; i < levels.length; i++) if (d >= levels[i].distance) cur = i;
+    for (let i = 0; i < levels.length; i++) levels[i].object.visible = i === cur;
+    this._currentLevel = cur;
+  }
+}
 
 // ===========================================================================
 function buildInterior(group, ctx, facadeMeshes, CHESTS) {
@@ -778,7 +879,6 @@ function buildInterior(group, ctx, facadeMeshes, CHESTS) {
   }
 
   // ---------------- instances ----------------
-  const GEO = unitGeometries();
   const glowMats = {
     dull: glowMaterial(M.pipeMetalDull, 'interiorMetal', { side: THREE.DoubleSide }),
     tin: glowMaterial(M.pipeMetalDull, 'interiorTin', { side: THREE.DoubleSide, roughness: 0.3, metalness: 0.95 }),
@@ -788,6 +888,14 @@ function buildInterior(group, ctx, facadeMeshes, CHESTS) {
   };
   glowMats.tin.color = new THREE.Color(0xc9cdcb);
   glowMats.zinc.color = new THREE.Color(0x7b8085);
+  const closedMats = {};
+  for (const k of ['dull', 'tin', 'zinc']) {
+    closedMats[k] = glowMats[k].clone();
+    closedMats[k].side = THREE.FrontSide;
+    closedMats[k].onBeforeCompile = glowMats[k].onBeforeCompile;
+    closedMats[k].customProgramCacheKey = glowMats[k].customProgramCacheKey;
+  }
+  const matFor = (geo, mat) => (isClosedPart(geo) && closedMats[mat]) || glowMats[mat];
 
   const buckets = new Map();   // key -> { geo, mat, m: [], owner: [] }
   const bucket = (geo, mat) => {
@@ -859,25 +967,85 @@ function buildInterior(group, ctx, facadeMeshes, CHESTS) {
     }
   }
 
-  const meshes = [];
+  // Level of detail and culling. Level 0 (camera < LOD_DIST[1] from the
+  // pipework: console, choir, close-ups) is split into spatial groups
+  // (LOD_GROUPS) so that, seen from the console, the high Great / Swell / Solo
+  // chests are frustum-culled (about 2/3 of the interior triangles); levels 1, 2
+  // are one InstancedMesh per bucket (from that far everything is in view).
+  // Every level reads the same per-bucket matrix / glow arrays (the level-0
+  // group meshes use subarray views of them), so glow writes reach all levels.
+  const groupOf = (p) => LOD_GROUPS[p.chest] || 'rest';
+  const GROUP_ORDER = [...new Set([...Object.values(LOD_GROUPS), 'rest'])];
+  const meshes = [];            // level-0 meshes (api.interiorMeshes; glow / instance mapping)
+  const glowAttrs = [];         // per level-0 mesh: every glow attribute viewing its data
   const perPipe = new Array(inventory.length).fill(0);
+  const GEO_LOD = LOD_DIST.map((_, i) => unitGeometries(i));
+  const levels = LOD_DIST.map(() => []);
+  const share = (src, glow) => {     // geometry sharing src's vertex data, with its own glow attribute
+    const g = new THREE.BufferGeometry();
+    for (const [k, v] of Object.entries(src.attributes)) g.setAttribute(k, v);
+    g.setIndex(src.index);
+    g.boundingBox = src.boundingBox; g.boundingSphere = src.boundingSphere;
+    g.setAttribute('aGlow', glow);
+    return g;
+  };
+  const instanced = (geo, mat, matrices, name, owner) => {
+    const m = new THREE.InstancedMesh(geo, mat, matrices.count);
+    m.instanceMatrix = matrices;
+    m.name = name;
+    m.castShadow = false;
+    m.receiveShadow = true;
+    m.matrixAutoUpdate = false;
+    m.computeBoundingBox();
+    // sphere around the (tight) instance box: InstancedMesh.computeBoundingSphere
+    // scales each unit geometry's sphere by the largest axis scale (the pipe
+    // length), which would defeat frustum culling of the groups
+    m.boundingSphere = m.boundingBox.getBoundingSphere(new THREE.Sphere());
+    m.userData.owner = owner;
+    return m;
+  };
   for (const b of [...buckets.values()].sort((a, c) => (a.key < c.key ? -1 : 1))) {
     const n = b.owner.length;
-    const geo = GEO[b.geo]();
-    const glow = new THREE.InstancedBufferAttribute(new Float32Array(n * 3), 3);
-    glow.setUsage(THREE.DynamicDrawUsage);
-    geo.setAttribute('aGlow', glow);
-    const mesh = new THREE.InstancedMesh(geo, glowMats[b.mat], n);
-    mesh.name = 'interior:' + b.key;
-    mesh.instanceMatrix.array.set(b.m);
-    mesh.instanceMatrix.needsUpdate = true;
-    mesh.castShadow = false;
-    mesh.receiveShadow = true;
-    mesh.computeBoundingBox();
-    mesh.computeBoundingSphere();
-    mesh.userData.owner = Int32Array.from(b.owner);
-    meshes.push(mesh);
+    // instances ordered by group (stable)
+    const ord = Array.from({ length: n }, (_, i) => i);
+    const gi = b.owner.map((o) => GROUP_ORDER.indexOf(groupOf(inventory[o])));
+    ord.sort((x, y) => gi[x] - gi[y] || x - y);
+    const mat = new Float32Array(n * 16), owner = new Int32Array(n), glowArr = new Float32Array(n * 3);
+    ord.forEach((src, i) => { mat.set(b.m.slice(src * 16, src * 16 + 16), i * 16); owner[i] = b.owner[src]; });
+    const material = matFor(b.geo, b.mat);
+    const base = GEO_LOD[0][b.geo]();
+    base.computeBoundingBox(); base.computeBoundingSphere();
+    const fullGlow = new THREE.InstancedBufferAttribute(glowArr, 3).setUsage(THREE.DynamicDrawUsage);
+    const fullMatrices = new THREE.InstancedBufferAttribute(mat, 16);
+    // level 0: one mesh per group
+    let s0 = 0;
+    for (let g = 0; g < GROUP_ORDER.length; g++) {
+      let s1 = s0;
+      while (s1 < n && gi[ord[s1]] === g) s1++;
+      if (s1 === s0) continue;
+      const glow = new THREE.InstancedBufferAttribute(glowArr.subarray(s0 * 3, s1 * 3), 3).setUsage(THREE.DynamicDrawUsage);
+      const m = instanced(share(base, glow), material, new THREE.InstancedBufferAttribute(mat.subarray(s0 * 16, s1 * 16), 16),
+        'interior:' + b.key + '@' + GROUP_ORDER[g], owner.subarray(s0, s1));
+      meshes.push(m);
+      glowAttrs.push([glow, fullGlow]);
+      levels[0].push(m);
+      s0 = s1;
+    }
     for (const o of b.owner) perPipe[o]++;
+    // levels 1, 2: one mesh per bucket (fewer radial segments for round parts)
+    for (let li = 1; li < LOD_DIST.length; li++) {
+      const lg = GEO_LOD[li][b.geo] ? GEO_LOD[li][b.geo]() : base;
+      if (lg !== base) { lg.computeBoundingBox(); lg.computeBoundingSphere(); }
+      levels[li].push(instanced(share(lg, fullGlow), material, fullMatrices, `interiorLod${li}:` + b.key, owner));
+    }
+  }
+  // Level-0 meshes of one group share one culling sphere around the group's
+  // box: per-bucket spheres of wide, low parts (boots, feet: 12 m x 0.3 m)
+  // would reach down into the console's view although their chest is out of it.
+  {
+    const gBox = new Map();
+    for (const m of levels[0]) { const k = m.name.split('@')[1]; if (!gBox.has(k)) gBox.set(k, new THREE.Box3()); gBox.get(k).union(m.boundingBox); }
+    for (const m of levels[0]) m.boundingSphere = gBox.get(m.name.split('@')[1]).getBoundingSphere(new THREE.Sphere());
   }
   // CSR: pipe -> instances
   const start = new Int32Array(inventory.length + 1);
@@ -891,7 +1059,20 @@ function buildInterior(group, ctx, facadeMeshes, CHESTS) {
 
   const pipeGroup = new THREE.Group();
   pipeGroup.name = 'interiorPipes';
-  pipeGroup.add(...meshes);
+  const lodBox = new THREE.Box3();
+  for (const m of levels[0]) lodBox.union(m.boundingBox);
+  const pipeLOD = new BoxLOD(lodBox);
+  pipeLOD.name = 'interiorPipesLOD';
+  const lodGroups = levels.map((list, i) => {
+    const lg = new THREE.Group();
+    lg.name = i ? 'interiorPipesLod' + i : 'interiorPipesNear';
+    lg.add(...list);
+    lg.visible = i === 0;
+    pipeLOD.addLevel(lg, LOD_DIST[i]);
+    return lg;
+  });
+  pipeGroup.add(pipeLOD);
+  for (const o of [pipeGroup, pipeLOD, ...lodGroups]) { o.matrixAutoUpdate = false; o.updateMatrix(); }
   group.add(pipeGroup);
 
   // ---------------- woodwork: chests, rack boards, swell boxes, shutters, ladders ----------------
@@ -1018,10 +1199,11 @@ function buildInterior(group, ctx, facadeMeshes, CHESTS) {
   const wood = new THREE.Group();
   wood.name = 'interiorWoodwork';
   wood.add(structMesh, rackMesh, slatMesh);
+  for (const o of [wood, structMesh, rackMesh, slatMesh]) { o.matrixAutoUpdate = false; o.updateMatrix(); }
   group.add(wood);
 
   return {
-    inventory, facadeAssignment, chestStats, unplaced, meshes, start, IM, II, shutters, writeShutters,
+    inventory, facadeAssignment, chestStats, unplaced, meshes, glowAttrs, start, IM, II, shutters, writeShutters,
     structure: { struct, rack }, buildMs: Date.now() - t0,
   };
 }
@@ -1037,28 +1219,49 @@ export function buildPipes(ctx) {
   group.add(facade);
 
   const dark = new Builder();
-  const pipes = [];           // facade pipe meshes (one per real pipe)
+  const pipes = [];           // facade pipe proxies (one per real pipe)
   const glowColor = new THREE.Color(GLOW_COLOR);
+  // The facade is drawn as one merged mesh per section kind (cluster / arch:
+  // they differ in roughness); a per-vertex pipe id indexes a small uniform
+  // array carrying each pipe's emissive glow and registration tint. Each real
+  // pipe keeps a proxy Mesh (name, userData, transform, geometry for bounds and
+  // raycasts, its own material object whose colour/emissive mirror the state
+  // as before) whose material is invisible, so it is never rendered.
+  const facadeParts = { cluster: [], arch: [] };
+  const facadeSlot = new Map();    // proxy -> [kind, index in the merged mesh]
 
   for (const sec of LAYOUT.sections || []) {
     if (sec.kind !== 'cluster' && sec.kind !== 'arch') continue;
     const items = layoutFacadeSection(sec, LAYOUT);
     items.forEach((it, index) => {
-      const mat = M.pipeMetal.clone();          // per-pipe clone: emissive note glow
+      const mat = M.pipeMetal.clone();          // per-pipe state (mirrored into the merged mesh's uniforms)
       mat.name = 'pipeMetal';
       mat.vertexColors = true;                  // lips slightly brighter
       mat.roughness = sec.kind === 'cluster' ? 0.26 : 0.2;   // plain silver-grey zinc / spotted tin
       mat.emissive.copy(glowColor);
       mat.emissiveIntensity = 0;
+      mat.visible = false;                      // proxy: drawn by the merged facade mesh
       const mesh = new THREE.Mesh(undefined, mat);
       mesh.position.set(it.x, it.y0, it.z);
       mesh.rotation.y = it.rotY;
+      mesh.matrixAutoUpdate = false;
       mesh.updateMatrix();
       dark.matrix = mesh.matrix;
-      mesh.geometry = buildFluePipe({
+      const full = buildFluePipe({
         r: it.r, len: it.foot + it.len, foot: it.foot,
         nb: it.r > 0.18 ? 18 : it.r > 0.1 ? 13 : 9,
       }, dark);
+      const slot = facadeParts[sec.kind].length;
+      facadeParts[sec.kind].push({ geo: full, matrix: mesh.matrix, mesh });
+      // proxy geometry: positions, normals + index (bounds, raycasting)
+      const pg = new THREE.BufferGeometry();
+      pg.setAttribute('position', full.attributes.position);
+      pg.setAttribute('normal', full.attributes.normal);
+      pg.setIndex(full.index);
+      pg.boundingBox = full.boundingBox.clone();
+      pg.boundingSphere = full.boundingSphere.clone();
+      mesh.geometry = pg;
+      facadeSlot.set(mesh, [sec.kind, slot]);
       mesh.name = `pipe:${sec.id}:${index}`;
       mesh.castShadow = true;
       mesh.receiveShadow = true;
@@ -1076,6 +1279,17 @@ export function buildPipes(ctx) {
   const darkMesh = new THREE.Mesh(dark.finish(), M.pipeDark);
   darkMesh.name = 'pipeMouthsAndTops';
   facade.add(darkMesh);
+  const facadeMerged = {};       // kind -> { mesh, state: Vector4[] (rgb = emissive radiance, w = colour factor) }
+  for (const [kind, parts] of Object.entries(facadeParts)) {
+    if (!parts.length) continue;
+    const mesh = new THREE.Mesh(mergeFacade(parts), facadeMaterial(parts[0].mesh.material, parts.length, kind));
+    mesh.name = 'facadePipes:' + kind;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    facade.add(mesh);
+    facadeMerged[kind] = { mesh, state: mesh.material.userData.state };
+  }
+  for (const o of [facade, ...facade.children]) { o.matrixAutoUpdate = false; o.updateMatrix(); }
 
   const CHESTS = chestsFor(LAYOUT);
   const I = buildInterior(group, ctx, pipes, CHESTS);
@@ -1182,6 +1396,9 @@ export function buildPipes(ctx) {
       else mat.emissive.copy(glowColor);
       mat.color.copy(mesh.userData.baseColor).multiplyScalar(1 + 0.18 * t);
       mesh.userData.glow = g;
+      const [kind, slot] = facadeSlot.get(mesh);
+      facadeMerged[kind].state[slot].set(mat.emissive.r * mat.emissiveIntensity, mat.emissive.g * mat.emissiveIntensity,
+        mat.emissive.b * mat.emissiveIntensity, 1 + 0.18 * t);
       return;
     }
     const e = ease(gCur[p]);
@@ -1346,7 +1563,7 @@ export function buildPipes(ctx) {
         if (g === gt && tv === tt && hv === ht) done.push(p);
       }
       for (const p of done) active.delete(p);
-      for (const mi of dirty) I.meshes[mi].geometry.attributes.aGlow.needsUpdate = true;
+      for (const mi of dirty) for (const a of I.glowAttrs[mi]) a.needsUpdate = true;
       dirty.clear();
     }
     if (animShutters.size) {
@@ -1405,9 +1622,9 @@ export function buildPipes(ctx) {
   };
   refreshBounds();
 
-  let draws = 0, tris = 0;
-  group.traverse((o) => {
-    if (!o.isMesh) return;
+  let draws = 0, tris = 0;   // as drawn with the near level of detail (proxies are not drawn)
+  group.traverseVisible((o) => {
+    if (!o.isMesh || !o.material.visible) return;
     draws++;
     const n = (o.geometry.index ? o.geometry.index.count : o.geometry.attributes.position.count) / 3;
     tris += n * (o.isInstancedMesh ? o.count : 1);

@@ -4,7 +4,9 @@
 // of the real specification (147 stops, 23 couplers, 3 tremulants, generated
 // from stoplist.js), thumb pistons in the key slips, brass toe pistons, three
 // balanced expression pedals, music desk, lamp, bench. Every control is an
-// individually pickable Mesh (see the contract in buildConsole). Local frame:
+// individually pickable Mesh (see the contract in buildConsole); it is drawn
+// through a few InstancedMeshes (one per shape x material), the pickable Mesh
+// itself being an invisible-material proxy. Local frame:
 // origin on the gallery floor, organist faces -Z, bench on +Z. Units: metres.
 import * as THREE from 'three';
 import { STOPS, DIVISIONS, COUPLERS, ACCESSORIES } from './stoplist.js';
@@ -438,6 +440,56 @@ class UVTemplate {
     g.boundingBox = this.base.boundingBox.clone();
     return g;
   }
+  // Geometry for an InstancedMesh drawn with atlasMaterial(): the per-control
+  // UV remapping that variant() bakes on the CPU is done in the vertex shader
+  // from per-instance attributes. aMode per vertex: 0 = fixed patch (baked
+  // here), 1 = 'cell' part (iCell = u0, v0, du, dv), 2 = overridable 'ivory'
+  // body part (iPatch = patch uv).
+  instanced(atlas) {
+    if (this._inst) return this._inst;
+    const src = this.base.attributes.uv.array;
+    const uv = new Float32Array(src.length), mode = new Float32Array(src.length / 2);
+    for (const { start, count, map } of this.ranges) {
+      const m = map === 'cell' ? 1 : map === 'ivory' ? 2 : 0;
+      const [pu, pv] = m === 0 ? atlas.patch(map) : [0, 0];
+      for (let i = start; i < start + count; i++) {
+        mode[i] = m;
+        if (m === 1) { uv[i * 2] = src[i * 2]; uv[i * 2 + 1] = src[i * 2 + 1]; } else { uv[i * 2] = pu; uv[i * 2 + 1] = pv; }
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', this.base.attributes.position);
+    g.setAttribute('normal', this.base.attributes.normal);
+    g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    g.setAttribute('aMode', new THREE.BufferAttribute(mode, 1));
+    g.boundingSphere = this.base.boundingSphere.clone();
+    g.boundingBox = this.base.boundingBox.clone();
+    this._inst = g;
+    return g;
+  }
+  // per-instance atlas parameters reproducing variant(atlas, cell, patchOverride)
+  instanceUV(atlas, cell, patchOverride = {}) {
+    const r = cell ? atlas.uv(cell, 3) : null;
+    return {
+      cell: r ? [r.u0, r.v0, r.u1 - r.u0, r.v1 - r.v0] : [0, 0, 0, 0],
+      patch: atlas.patch(patchOverride.ivory || 'ivory'),
+    };
+  }
+}
+
+// Clone of an atlas material for instanced controls (see UVTemplate.instanced).
+function atlasMaterial(base, name) {
+  const m = base.clone();
+  m.name = name;
+  m.onBeforeCompile = (sh) => {
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float aMode;\nattribute vec4 iCell;\nattribute vec2 iPatch;')
+      .replace('#include <uv_vertex>', '#include <uv_vertex>\n#ifdef USE_MAP\n' +
+        'vec2 atlasUv = aMode > 1.5 ? iPatch : ( aMode > 0.5 ? iCell.xy + uv * iCell.zw : uv );\n' +
+        'vMapUv = ( mapTransform * vec3( atlasUv, 1.0 ) ).xy;\n#endif');
+  };
+  m.customProgramCacheKey = () => 'consoleAtlasInstanced';
+  return m;
 }
 
 function plateTexture() {
@@ -564,7 +616,8 @@ function pistonFace(a) {
 }
 
 // ====================================================================== build
-// CONTRACT (raycast targets are the Meshes in ctx.pickables; this module only
+// CONTRACT (raycast targets are the Meshes in ctx.pickables, invisible-material
+// proxies with the controls' real geometry and transform; this module only
 // listens to the bus and animates):
 //   key      userData { type:'key', midi, manual }                bus noteon/noteoff
 //   stop     userData { type:'stop', id, label, division }        bus 'stop' { id, on }
@@ -605,6 +658,59 @@ export function buildConsole(ctx) {
   knobMat.name = 'consoleControls';
   const brassMat = new THREE.MeshStandardMaterial({ color: 0xffffff, map: atlasTex, metalness: 1, roughness: 0.34 });
   brassMat.name = 'consoleBrassControls';
+  const knobInst = atlasMaterial(knobMat, 'consoleControls');
+  const brassInst = atlasMaterial(brassMat, 'consoleBrassControls');
+
+  // ---- rendering of the controls ----
+  // Every control (key, drawknob, piston, swell shoe) is a lightweight proxy
+  // Mesh: it keeps the geometry, transform, userData and animation state of the
+  // control and stays in ctx.pickables (Raycaster ignores material.visible),
+  // but its material is invisible, so the renderer and the shadow pass skip
+  // it. What is drawn are a few InstancedMeshes (one per geometry x material)
+  // whose instance matrices mirror the proxies' local matrices.
+  const proxyMat = new THREE.MeshBasicMaterial({ visible: false });
+  proxyMat.name = 'consoleControlProxy';
+  const batches = new Map();         // key -> { geo, mat, proxies, uv, cast, margin, mesh, dirty }
+  const slotOf = new Map();          // proxy -> [batch, index]
+  const visual = (proxy, key, geo, mat, { cast = false, uv = null, margin = 0.02 } = {}) => {
+    if (!batches.has(key)) batches.set(key, { key, geo, mat, proxies: [], uv: [], cast, margin, mesh: null, dirty: false });
+    const b = batches.get(key);
+    slotOf.set(proxy, [b, b.proxies.length]);
+    b.proxies.push(proxy);
+    b.uv.push(uv);
+    proxy.matrixAutoUpdate = false;
+    proxy.updateMatrix();
+  };
+  // write a proxy's (changed) transform into its instance
+  const sync = (proxy) => {
+    proxy.updateMatrix();
+    const s = slotOf.get(proxy);
+    if (s && s[0].mesh) { s[0].mesh.setMatrixAt(s[1], proxy.matrix); s[0].dirty = true; }
+  };
+  const buildBatches = () => {
+    for (const b of batches.values()) {
+      const n = b.proxies.length;
+      const mesh = new THREE.InstancedMesh(b.geo, b.mat, n);
+      mesh.name = 'consoleInstanced:' + b.key;
+      b.proxies.forEach((p, i) => mesh.setMatrixAt(i, p.matrix));
+      if (b.uv[0]) {
+        const cell = new Float32Array(n * 4), patch = new Float32Array(n * 2);
+        b.uv.forEach((u, i) => { cell.set(u.cell, i * 4); patch.set(u.patch, i * 2); });
+        b.geo.setAttribute('iCell', new THREE.InstancedBufferAttribute(cell, 4));
+        b.geo.setAttribute('iPatch', new THREE.InstancedBufferAttribute(patch, 2));
+      }
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      mesh.computeBoundingBox();
+      mesh.computeBoundingSphere();
+      mesh.boundingSphere.radius += b.margin;   // room for key dip / knob draw / shoe tilt
+      mesh.castShadow = b.cast;
+      mesh.receiveShadow = true;
+      mesh.matrixAutoUpdate = false;
+      mesh.updateMatrix();
+      b.mesh = mesh;
+      group.add(mesh);
+    }
+  };
 
   const lerpAnim = (apply, up = 55, down = 32, cur = 0) => ({
     cur, target: cur, apply,
@@ -726,18 +832,21 @@ export function buildConsole(ctx) {
     const y = manualY(man), z = manualZ(man);
     for (let midi = 36; midi <= 96; midi++) {
       const n = midi - 36, oct = Math.floor(n / 12), pc = n % 12;
-      let mesh;
+      let mesh, vkey, vmat;
       if (pc in NAT_INDEX) {
         const ni = NAT_INDEX[pc];
-        mesh = new THREE.Mesh(midi === 96 ? KG.topC : KG.naturals[ni], M.ivory);
+        mesh = new THREE.Mesh(midi === 96 ? KG.topC : KG.naturals[ni], proxyMat);
         mesh.position.set(xLeft + (oct * 7 + ni + 0.5) * NAT_W, y, z - KEY_L);
+        vkey = midi === 96 ? 'naturalTopC' : 'natural' + ni; vmat = M.ivory;
       } else {
-        mesh = new THREE.Mesh(KG.sharp, M.ebony);
+        mesh = new THREE.Mesh(KG.sharp, proxyMat);
         mesh.position.set(xLeft + oct * OCTAVE + KG.sharpC[SHARP_INDEX[pc]], y, z - KEY_L);
+        vkey = 'sharp'; vmat = M.ebony;
       }
       mesh.castShadow = mesh.receiveShadow = true;
       mesh.userData = { type: 'key', midi, manual: man };
-      anims.set(mesh, lerpAnim((v) => { mesh.rotation.x = v * KEY_DIP; }));
+      visual(mesh, vkey, mesh.geometry, vmat, { cast: true });
+      anims.set(mesh, lerpAnim((v) => { mesh.rotation.x = v * KEY_DIP; sync(mesh); }));
       keys.set(`${man}:${midi}`, mesh);
       pickables.push(mesh);
       group.add(mesh);
@@ -840,11 +949,12 @@ export function buildConsole(ctx) {
             }
             const cell = atlas.knobCell();
             drawKnobFace(atlas.g, cell, cellOpts);
-            const mesh = new THREE.Mesh(knobT.variant(atlas, cell), knobMat);
+            const mesh = new THREE.Mesh(knobT.base, proxyMat);
             mesh.position.copy(base);
             mesh.rotation.y = ry;
             mesh.userData = ud;
-            register(mesh, ud.type, d.id, lerpAnim((v) => { mesh.position.copy(base).addScaledVector(nrm, v * STOP_TRAVEL); }));
+            register(mesh, ud.type, d.id, lerpAnim((v) => { mesh.position.copy(base).addScaledVector(nrm, v * STOP_TRAVEL); sync(mesh); }));
+            visual(mesh, 'drawknob', knobT.instanced(atlas), knobInst, { uv: knobT.instanceUV(atlas, cell), margin: STOP_TRAVEL + 0.002 });
             placed.add(d.id);
             black.add(washG.clone(), TM(base.x, base.y, base.z, 0, ry, 0));
           });
@@ -902,20 +1012,23 @@ export function buildConsole(ctx) {
       { geo: new THREE.BoxGeometry(0.02, 0.028, 0.006).translate(0, 0, 0.003), map: 'ivory' },
       { geo: new THREE.PlaneGeometry(0.0194, 0.0274).translate(0, 0, 0.0061), map: 'cell' },
     ]);
+    pistonT.key = 'thumbPiston'; studT.key = 'toeStud'; tabletT.key = 'tablet';
     const _q = new THREE.Quaternion(), _s = new THREE.Vector3();
     const addPiston = (a, template, mat, matrix, square = false) => {
       const f = pistonFace(a);
       const cell = atlas.smallCell();
       const toeStyle = f.toe ? { bg: '#b8944e', ink: '#24170a', ring: 'rgba(40,26,10,0.5)' } : {};
       drawSmallFace(atlas.g, cell, f.text, { ...toeStyle, ...f, square });
-      const mesh = new THREE.Mesh(template.variant(atlas, cell, f.body ? { ivory: f.body } : {}), mat);
+      const mesh = new THREE.Mesh(template.base, proxyMat);
       const base = new THREE.Vector3();
       matrix.decompose(base, _q, _s);
       mesh.position.copy(base);
       mesh.quaternion.copy(_q);
       const axis = new THREE.Vector3(0, 0, 1).applyQuaternion(_q);
       mesh.userData = { type: 'piston', id: a.id, label: a.name, kind: a.kind };
-      register(mesh, 'piston', a.id, pulseAnim((d) => { mesh.position.copy(base).addScaledVector(axis, -d * PISTON_TRAVEL); }));
+      register(mesh, 'piston', a.id, pulseAnim((d) => { mesh.position.copy(base).addScaledVector(axis, -d * PISTON_TRAVEL); sync(mesh); }));
+      visual(mesh, template.key, template.instanced(atlas), mat === brassMat ? brassInst : knobInst,
+        { uv: template.instanceUV(atlas, cell, f.body ? { ivory: f.body } : {}), margin: PISTON_TRAVEL + 0.002 });
       done.add(a.id);
     };
 
@@ -976,12 +1089,13 @@ export function buildConsole(ctx) {
     const step = 0.115, x0 = swellDefs.length === 3 ? SWELL_X[0] : 0.04 - (swellDefs.length - 1) * step / 2;
     swellDefs.forEach((a, i) => {
       const x = swellDefs.length === 3 ? SWELL_X[i] : x0 + i * step;
-      const mesh = new THREE.Mesh(shoeG, brassMat);
+      const mesh = new THREE.Mesh(shoeG, proxyMat);
       mesh.position.set(x, SWELL_PIVOT[0], SWELL_PIVOT[1]);
       mesh.userData = { type: 'swell', id: a.id, label: a.name };
-      const anim = lerpAnim((v) => { mesh.rotation.x = SWELL_CLOSED + (SWELL_OPEN - SWELL_CLOSED) * v; }, 9, 9, 1);
+      const anim = lerpAnim((v) => { mesh.rotation.x = SWELL_CLOSED + (SWELL_OPEN - SWELL_CLOSED) * v; sync(mesh); }, 9, 9, 1);
       anim.apply(1);
       register(mesh, 'swell', a.id, anim);
+      visual(mesh, 'swellShoe', shoeG, brassMat);
       black.add(new THREE.BoxGeometry(0.03, 0.03, 0.14), TM(x, 0.285, -0.29));                       // pivot bracket
       done.add(a.id);
     });
@@ -1074,13 +1188,14 @@ export function buildConsole(ctx) {
       if (isNat) nat++;
       const a = ((isNat ? nat : nat + 0.5) - 9) * PED_DA;
       const X = PED_R * Math.sin(a);
-      const mesh = new THREE.Mesh(isNat ? natG : sharpG, isNat ? maple : sharpMats);
+      const mesh = new THREE.Mesh(isNat ? natG : sharpG, isNat ? proxyMat : [proxyMat, proxyMat]);
       mesh.position.set(PED_HEEL * Math.sin(a), pedY(X), PED_PZ - PED_HEEL * Math.cos(a));
       mesh.rotation.order = 'YZX';
       mesh.rotation.set(0, -a, Math.asin(X / PED_R));
       mesh.castShadow = mesh.receiveShadow = true;
       mesh.userData = { type: 'key', midi, manual: 4 };
-      anims.set(mesh, lerpAnim((v) => { mesh.rotation.x = -v * PED_DIP; }));
+      visual(mesh, isNat ? 'pedalNatural' : 'pedalSharp', mesh.geometry, isNat ? maple : sharpMats, { cast: true, margin: 0.03 });
+      anims.set(mesh, lerpAnim((v) => { mesh.rotation.x = -v * PED_DIP; sync(mesh); }));
       keys.set(`4:${midi}`, mesh);
       pickables.push(mesh);
       group.add(mesh);
@@ -1136,6 +1251,9 @@ export function buildConsole(ctx) {
   add(black, M.black, 'consoleBlack');
   add(ebony, M.ebony, 'consoleEbony');
   add(paper, M.paper, 'consolePaper');
+  // everything except the control proxies is static
+  for (const o of group.children) if (!slotOf.has(o)) { o.matrixAutoUpdate = false; o.updateMatrix(); }
+  buildBatches();
 
   // -------------------------------------------------------------- behaviour
   const drive = (mesh, target) => {
@@ -1167,6 +1285,7 @@ export function buildConsole(ctx) {
     if (!active.size) return;
     const step = Number.isFinite(dt) && dt > 0 ? dt : 1 / 60;
     for (const a of active) if (a.tick(step)) active.delete(a);
+    for (const b of batches.values()) if (b.dirty) { b.mesh.instanceMatrix.needsUpdate = true; b.dirty = false; }
   });
 
   // world-space viewpoints for the integrator
@@ -1210,6 +1329,10 @@ export function buildConsole(ctx) {
       atlasTex.dispose();
       knobMat.dispose();
       brassMat.dispose();
+      knobInst.dispose();
+      brassInst.dispose();
+      proxyMat.dispose();
+      for (const b of batches.values()) b.mesh?.dispose();
     },
   };
   return group;

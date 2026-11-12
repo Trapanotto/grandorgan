@@ -10,25 +10,47 @@
   #app canvas { display: block; }
   #ui { position: fixed; inset: 0; pointer-events: none; }
   #ui > * { pointer-events: auto; }
-  /* Case toggle (created in main.js). Styled like the register panel (.rah-glass /
-     .rah-btn in interaction.js) and parked in the top-left column directly under the
-     title, where interaction.js reserves a slot for it (wide: top 72–104 px, narrow
-     < 900 px: top 56–84 px). It therefore never meets the bottom view bar, the panel
-     (top-right) or the sound hint (below the slot) at any width. */
-  #case-toggle { position: fixed; left: 22px; top: 72px; margin: 0; box-sizing: border-box; max-width: calc(100vw - 44px);
+  /* Toggle row under the title: #rah-toggles (created by interaction.js) holds
+     #case-toggle (main.js, first) and #technik-toggle. Styled like the register panel
+     (.rah-glass / .rah-btn in interaction.js) and parked in the top-left column directly
+     under the title, where interaction.js reserves a slot for it (wide: top 72–104 px,
+     narrow < 900 px: top 56–84 px). The row is as wide as the title column (it ends left
+     of the register panel); when space is short the case toggle shrinks with an ellipsis,
+     "Technik" never. So the row never meets the bottom view bar, the register panel
+     (top-right), the sound hint (below the slot) or the Technik panel (below the hint). */
+  #rah-toggles { position: fixed; left: 22px; top: 72px; display: flex; flex-wrap: nowrap; align-items: stretch; gap: 6px; max-width: calc(100vw - 474px); pointer-events: none; }
+  #rah-toggles > * { pointer-events: auto; }
+  #case-toggle, #technik-toggle { margin: 0; box-sizing: border-box; min-width: 0;
     font-family: 'Cormorant Garamond', 'EB Garamond', Georgia, 'Times New Roman', serif; font-size: 13px; line-height: 18px; letter-spacing: .05em;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #f0e6d2;
     background: rgba(14, 9, 7, .8); border: 1px solid rgba(217, 164, 65, .32); border-radius: 6px; padding: 6px 12px;
     box-shadow: 0 8px 30px rgba(0, 0, 0, .5); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
     cursor: pointer; -webkit-user-select: none; user-select: none; transition: background .2s, border-color .2s, color .2s; }
+  #case-toggle { flex: 0 1 auto; }
+  #technik-toggle { flex: none; }
+  /* stand-alone fallback (UI overlay failed): the case toggle keeps its old fixed slot */
+  #ui > #case-toggle { position: fixed; left: 22px; top: 72px; max-width: calc(100vw - 44px); }
   #case-toggle::before { content: '\25A3'; margin-right: 7px; color: #d9a441; font-size: 11px; }
-  #case-toggle:hover { border-color: #d9a441; color: #f3d48c; }
-  #case-toggle:focus-visible { outline: 2px solid #f3d48c; outline-offset: 1px; }
-  #case-toggle[aria-pressed="true"] { background: #d9a441; border-color: #d9a441; color: #1a0f08; }
+  #technik-toggle::before { content: ''; display: inline-block; width: 18px; height: 7px; margin-right: 7px; vertical-align: 1px; border-radius: 2px;
+    background: linear-gradient(90deg, #4aa3ff 0 33%, #ffd34a 33% 66%, #ff5a4a 66%); }
+  #case-toggle:hover, #technik-toggle:hover { border-color: #d9a441; color: #f3d48c; }
+  #case-toggle:focus-visible, #technik-toggle:focus-visible { outline: 2px solid #f3d48c; outline-offset: 1px; }
+  #case-toggle[aria-pressed="true"], #technik-toggle[aria-pressed="true"] { background: #d9a441; border-color: #d9a441; color: #1a0f08; }
   #case-toggle[aria-pressed="true"]::before { content: '\25A1'; color: #1a0f08; }
+  #technik-toggle[aria-pressed="true"]::before { box-shadow: 0 0 0 1px #1a0f08; }
   @media (max-width: 899px) {
-    #case-toggle { left: 12px; top: 56px; max-width: calc(100vw - 24px); font-size: 12px; line-height: 16px; padding: 5px 10px; }
+    #rah-toggles { left: 12px; top: 56px; max-width: calc(100vw - 24px); gap: 5px; }
+    #ui > #case-toggle { left: 12px; top: 56px; max-width: calc(100vw - 24px); }
+    #case-toggle, #technik-toggle { font-size: 12px; line-height: 16px; padding: 5px 10px; }
   }
+  /* 600–899 px with the register panel expanded (360 px at the right): stay left of it */
+  @media (min-width: 600px) and (max-width: 899px) {
+    #ui:has(.rah-panel:not(.rah-collapsed)) #rah-toggles { max-width: calc(100vw - 394px); }
+  }
+  /* optional performance readout (F9, main.js) */
+  #perf-readout { position: fixed; left: 8px; bottom: 72px; z-index: 30; pointer-events: none; margin: 0; padding: 4px 7px; white-space: pre;
+    font: 11px/1.4 ui-monospace, Menlo, Consolas, monospace; color: #d8f0d0; background: rgba(0, 0, 0, .72); border: 1px solid rgba(160, 220, 150, .35); border-radius: 4px; }
+  #perf-readout[hidden] { display: none; }
   #loading { position: fixed; inset: 0; display: grid; place-items: center; font-size: 18px; letter-spacing: .08em; }
 </style>
 <script type="importmap">

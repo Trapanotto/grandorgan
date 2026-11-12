@@ -577,6 +577,285 @@ export const NARROW_PX = 900;
 export const easeInOut = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
 
 // ---------------------------------------------------------------------------
+// Technik-Modus (pure parts): ghosting, station data, views
+// ---------------------------------------------------------------------------
+// Contract of js/technik.js (every member optional): group.userData.api =
+// { setActive(on), isActive(), systems: [{ id, label, color }], setSystemVisible(id, on),
+//   stations: [{ id, system, title, text, position: Vector3, view: { pos, target } }],
+//   facts: { sourced, assumed, sources }, stats }. Optional extra honoured here:
+//   isAnimating() -> bool (lets the frame loop idle while the mode is on).
+export const TECHNIK_KEY = 'F8';
+export const PERF_KEY = 'F9';
+/** opacity of each ghosted group in Technik-Modus (a material shared by several groups gets the highest) */
+export const GHOST_OPACITY = Object.freeze({ case: 0.15, hall: 0.12, pipes: 0.25, console: 0.5 });
+/** hall meshes kept (opaque) in Technik-Modus; every other hall mesh is hidden (ghosted walls only clutter) */
+export const HALL_KEEP = /floor|stage|boden/i;
+export const TECHNIK_SYSTEMS_DEFAULT = Object.freeze([
+  { id: 'wind', label: 'Wind', color: '#4aa3ff' },
+  { id: 'elektrik', label: 'Elektrik', color: '#ffd34a' },
+  { id: 'mechanik', label: 'Mechanik', color: '#ff5a4a' },
+]);
+export const TECHNIK_OVERVIEW = Object.freeze({
+  id: 'technik-uebersicht', label: 'Technik-Übersicht', pos: [17, 16, 21], target: [0, 8.5, -2.5], fit: [24, 22],
+  desc: 'schräg von oben in die durchscheinende Orgel mit allen technischen Anlagen',
+});
+
+const isRenderable = (o) => !!(o && (o.isMesh || o.isLine || o.isPoints || o.isSprite));
+const matsOf = (o) => (Array.isArray(o.material) ? o.material : o.material ? [o.material] : []);
+
+/**
+ * Ghosting of the organ groups. Traverses the groups once (on the first apply),
+ * remembers transparent / opacity / depthWrite of every material exactly once
+ * (materials are shared between meshes), castShadow of every caster and the
+ * visibility of hidden hall meshes, and restores all of it exactly.
+ * Only those three material properties are touched, so ShaderMaterials and
+ * onBeforeCompile materials keep working (needsUpdate only when `transparent`
+ * flips). Materials also used by `exclude` (the technik group) are never ghosted.
+ * hall: 'hide' (default: every hall mesh not matching hallKeep is hidden) or 'ghost'.
+ */
+export function createGhoster({ groups = {}, exclude = null, opacity = GHOST_OPACITY, hall = 'hide', hallKeep = HALL_KEEP } = {}) {
+  let plan = null;
+  let active = false;
+  const savedMat = new Map();
+  const savedCast = new Map();
+  const savedVis = new Map();
+  function build() {
+    const excluded = new Set();
+    if (exclude && typeof exclude.traverse === 'function') exclude.traverse((o) => { if (isRenderable(o)) for (const m of matsOf(o)) excluded.add(m); });
+    const mats = new Map();
+    const casters = [];
+    const hide = [];
+    for (const [name, op] of Object.entries(opacity)) {
+      const g = groups && groups[name];
+      if (!g || g === exclude || typeof g.traverse !== 'function') continue;
+      g.traverse((o) => {
+        if (!isRenderable(o)) return;
+        if (name === 'hall' && hall === 'hide') {
+          if (!hallKeep.test(o.name || '')) hide.push(o);
+          return; // kept hall meshes (floor) stay untouched and opaque
+        }
+        if (o.castShadow) casters.push(o);
+        for (const m of matsOf(o)) {
+          if (!m || typeof m !== 'object' || excluded.has(m)) continue;
+          mats.set(m, Math.max(mats.get(m) ?? 0, op));
+        }
+      });
+    }
+    plan = { mats, casters, hide };
+  }
+  function apply() {
+    if (active) return false;
+    if (!plan) build();
+    for (const [m, op] of plan.mats) {
+      savedMat.set(m, { transparent: m.transparent, opacity: m.opacity, depthWrite: m.depthWrite });
+      const was = m.transparent;
+      m.transparent = true;
+      m.opacity = Math.min(typeof m.opacity === 'number' ? m.opacity : 1, op);
+      m.depthWrite = false;
+      if (!was) m.needsUpdate = true;
+    }
+    for (const o of plan.casters) { savedCast.set(o, o.castShadow); o.castShadow = false; }
+    for (const o of plan.hide) { savedVis.set(o, o.visible); o.visible = false; }
+    active = true;
+    return true;
+  }
+  function restore() {
+    if (!active) return false;
+    for (const [m, s] of savedMat) {
+      const flip = m.transparent !== s.transparent;
+      m.transparent = s.transparent; m.opacity = s.opacity; m.depthWrite = s.depthWrite;
+      if (flip) m.needsUpdate = true;
+    }
+    for (const [o, v] of savedCast) o.castShadow = v;
+    for (const [o, v] of savedVis) o.visible = v;
+    savedMat.clear(); savedCast.clear(); savedVis.clear();
+    active = false;
+    return true;
+  }
+  return {
+    apply, restore,
+    isActive: () => active,
+    stats: () => (plan ? { materials: plan.mats.size, casters: plan.casters.length, hidden: plan.hide.length } : { materials: 0, casters: 0, hidden: 0 }),
+  };
+}
+
+/** CSS colour from a technik system colour (number 0xRRGGBB, '#rgb', 'rgb(...)', THREE.Color) */
+export function cssColor(c, fallback = '#d9a441') {
+  if (typeof c === 'number' && Number.isFinite(c)) return `#${(Math.max(0, Math.floor(c)) & 0xffffff).toString(16).padStart(6, '0')}`;
+  if (typeof c === 'string' && /^(#[0-9a-f]{3,8}|rgba?\([\d\s.,%]+\)|hsla?\([\d\s.,%deg]+\))$/i.test(c.trim())) return c.trim();
+  if (c && typeof c === 'object' && typeof c.getHexString === 'function') { try { return `#${c.getHexString()}`; } catch { /* ignore */ } }
+  return fallback;
+}
+const vec3Of = (v) => {
+  if (Array.isArray(v) && v.length >= 3 && v.slice(0, 3).every(Number.isFinite)) return { x: v[0], y: v[1], z: v[2] };
+  if (v && typeof v === 'object' && [v.x, v.y, v.z].every(Number.isFinite)) return { x: v.x, y: v.y, z: v.z };
+  return null;
+};
+const arr3 = (v) => { const p = vec3Of(v); return p ? [p.x, p.y, p.z] : null; };
+
+/** systems of the technik api, defaults (Wind / Elektrik / Mechanik) when missing */
+export function technikSystems(api) {
+  const list = api && Array.isArray(api.systems) ? api.systems.filter((s) => s && typeof s.id === 'string') : [];
+  const src = list.length ? list : TECHNIK_SYSTEMS_DEFAULT;
+  return src.map((s) => {
+    const def = TECHNIK_SYSTEMS_DEFAULT.find((d) => d.id === s.id);
+    return { id: s.id, label: String(s.label || (def && def.label) || s.id), color: cssColor(s.color, def ? def.color : '#d9a441') };
+  });
+}
+
+/** camera view of a station: its own `view`, else looking at its position from the front / above */
+export function stationView(st) {
+  const v = st && st.view;
+  const pos = v && arr3(v.pos || v.position), target = v && arr3(v.target);
+  if (pos && target) return { pos, target };
+  const p = st && vec3Of(st.position);
+  if (!p) return null;
+  return { pos: [p.x + 3.5, p.y + 3, p.z + 7], target: [p.x, p.y, p.z] };
+}
+
+/** stations in tour order: grouped by system (systems order), stable inside a system; unknown systems last */
+export function technikStations(api) {
+  const raw = api && Array.isArray(api.stations) ? api.stations : [];
+  const order = technikSystems(api).map((s) => s.id);
+  const out = [];
+  raw.forEach((st, i) => {
+    if (!st || typeof st !== 'object') return;
+    out.push({
+      id: typeof st.id === 'string' || typeof st.id === 'number' ? String(st.id) : `station-${i}`,
+      system: String(st.system || ''), title: String(st.title || st.id || `Station ${i + 1}`), text: st.text ? String(st.text) : '',
+      position: vec3Of(st.position), view: stationView(st), i,
+    });
+  });
+  const rank = (s) => { const r = order.indexOf(s.system); return r < 0 ? order.length : r; };
+  out.sort((a, b) => rank(a) - rank(b) || a.i - b.i);
+  return out;
+}
+
+/** extra bottom-bar presets in Technik-Modus: overview + the first station (with a view) of every system */
+export function technikPresets(api) {
+  const out = [{ ...TECHNIK_OVERVIEW }];
+  const stations = technikStations(api);
+  for (const sys of technikSystems(api)) {
+    const st = stations.find((s) => s.system === sys.id && s.view);
+    if (st) out.push({ id: `technik-${sys.id}`, label: sys.label, pos: st.view.pos, target: st.view.target, desc: st.title, station: st.id, color: sys.color });
+  }
+  return out;
+}
+
+/** world point -> NDC with the camera's matrixWorldInverse / projectionMatrix elements (column-major); null if behind */
+export function projectToNdc(p, view, proj) {
+  const { x, y, z } = p;
+  const vx = view[0] * x + view[4] * y + view[8] * z + view[12];
+  const vy = view[1] * x + view[5] * y + view[9] * z + view[13];
+  const vz = view[2] * x + view[6] * y + view[10] * z + view[14];
+  if (!(vz < -1e-4)) return null; // at or behind the camera
+  const cx = proj[0] * vx + proj[4] * vy + proj[8] * vz + proj[12];
+  const cy = proj[1] * vx + proj[5] * vy + proj[9] * vz + proj[13];
+  const cw = proj[3] * vx + proj[7] * vy + proj[11] * vz + proj[15];
+  if (!(cw > 0)) return null;
+  return { x: cx / cw, y: cy / cw, depth: -vz };
+}
+
+// ---------------------------------------------------------------------------
+// Frame loop scheduling (pure; time in seconds is passed in) — used by main.js
+// ---------------------------------------------------------------------------
+/** after a bus event: keep rendering (glow fades, key / shutter travel) and keep updating shadows (moving casters) */
+export const BUS_RENDER_HOLD = 1.0;
+export const SWELL_RENDER_HOLD = 1.5;   // shutters travel at 1.5 / s
+export const INPUT_RENDER_HOLD = 1.0;   // any pointer / keyboard event
+export const SHADOW_HOLD = 0.45;
+export const SWELL_SHADOW_HOLD = 1.0;
+const SHADOW_EVENTS = new Set(['noteon', 'noteoff', 'stop', 'coupler', 'tremulant', 'piston', 'allnotesoff']);
+/** { render, shadow } hold times in seconds for a bus event type */
+export function busHolds(type) {
+  if (type === 'swell') return { render: SWELL_RENDER_HOLD, shadow: SWELL_SHADOW_HOLD };
+  return { render: BUS_RENDER_HOLD, shadow: SHADOW_EVENTS.has(type) ? SHADOW_HOLD : 0 };
+}
+
+/**
+ * "Something changed" scheduler. request(seconds) from anywhere (also between frames);
+ * frame(now, active) once per animation frame -> true = render (resp. update shadows) now.
+ * Renders when: requested since the last frame, inside a hold window, `active`, or during the
+ * first `initialFrames` frames.
+ */
+export function createHoldScheduler({ initialFrames = 0 } = {}) {
+  let until = -Infinity;
+  let flagged = false;
+  let hold = 0;
+  let frames = Math.max(0, initialFrames | 0);
+  return {
+    request(seconds = 0) { flagged = true; const s = +seconds; if (s > hold) hold = s; },
+    frame(now, active = false) {
+      if (flagged) { if (hold > 0) until = Math.max(until, now + hold); }
+      const go = !!active || flagged || frames > 0 || now < until;
+      flagged = false; hold = 0;
+      if (frames > 0) frames--;
+      return go;
+    },
+    holdUntil: () => until,
+    pending: () => flagged,
+  };
+}
+
+export const PIXEL_RATIO_STEPS = [2, 1.5, 1.25, 1, 0.85];
+/** pixel-ratio ladder from the start value min(devicePixelRatio, 2) down to 0.85 */
+export function pixelRatioLadder(dpr) {
+  const cap = Math.min(Number.isFinite(dpr) && dpr > 0 ? dpr : 1, 2);
+  return [cap, ...PIXEL_RATIO_STEPS.filter((s) => s < cap - 1e-6)];
+}
+/**
+ * Adaptive resolution with hysteresis. sample(now, intervalMs, workMs, allowed) is fed with
+ * consecutive rendered frames only (rAF interval, CPU work of the frame). Returns the new pixel
+ * ratio when it changes, else null.
+ *  down: moving average of the frame interval > downMs (22) for > downAfter (1 s)
+ *  up:   average CPU work < upMs (12) and interval < upIntervalMs (17.5, i.e. vsync is held)
+ *        for > upAfter (3 s); a level we had to leave again within 10 s of stepping up to it
+ *        is locked for lockSeconds (30 s, doubling) – no ping-pong.
+ *  allowed = false (camera preset flight) resets the timers; nothing changes then.
+ */
+export function createAdaptiveResolution({ devicePixelRatio = 1, downMs = 22, upMs = 12, upIntervalMs = 17.5, downAfter = 1, upAfter = 3, smoothing = 0.1, settle = 0.5, lockSeconds = 30 } = {}) {
+  const ladder = pixelRatioLadder(devicePixelRatio);
+  let level = 0;
+  let avg = null, work = null, overSince = null, underSince = null;
+  let changedAt = -Infinity, upAt = -Infinity, lock = lockSeconds;
+  const lockedUntil = new Map();
+  const reset = () => { overSince = null; underSince = null; };
+  function change(now, to, up) {
+    level = to; changedAt = now; avg = null; work = null; reset();
+    if (up) upAt = now;
+    return ladder[level];
+  }
+  return {
+    ladder,
+    sample(now, intervalMs, workMs = intervalMs, allowed = true) {
+      if (!allowed || !Number.isFinite(intervalMs) || intervalMs <= 0) { reset(); return null; }
+      if (intervalMs > 250) return null; // hitch (tab switch, GC): not representative
+      avg = avg === null ? intervalMs : avg + (intervalMs - avg) * smoothing;
+      const w = Number.isFinite(workMs) ? workMs : intervalMs;
+      work = work === null ? w : work + (w - work) * smoothing;
+      if (now - changedAt < settle) return null;
+      if (avg > downMs) {
+        underSince = null;
+        if (overSince === null) overSince = now;
+        if (now - overSince > downAfter && level < ladder.length - 1) {
+          if (now - upAt < 10) { lockedUntil.set(level, now + lock); lock *= 2; }
+          return change(now, level + 1, false);
+        }
+      } else if (avg < upIntervalMs && work < upMs) {
+        overSince = null;
+        if (underSince === null) underSince = now;
+        if (now - underSince > upAfter && level > 0 && !(now < (lockedUntil.get(level - 1) ?? -Infinity))) return change(now, level - 1, true);
+      } else reset();
+      return null;
+    },
+    pixelRatio: () => ladder[level],
+    level: () => level,
+    average: () => avg,
+    workAverage: () => work,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Note book: reference-counted note state per input source (pure)
 // ---------------------------------------------------------------------------
 export function createNoteBook(bus) {
@@ -684,11 +963,10 @@ export function scoreToTimeline(score) {
 }
 
 /** Built-in pieces for the demo menu. */
-// After BWV 565: Pachelbel, Bach BWV 147, Elgar, Clarke (note data, sources and compiler in pieces.js).
+// The complete Toccata and Fugue BWV 565 (note data, source and compiler in pieces.js).
 // Their registration also sets swell pedals; score events { reg: { on, off, swell } }
 // change the registration mid-piece. Everything is restored afterwards.
 export const DEMO_PIECES = [
-  { id: 'bwv565', title: 'Toccata d-Moll BWV 565', subtitle: 'J. S. Bach (1685–1750) · Anfang (gemeinfrei) · Plenum mit Tubas', build: () => buildDemoScore(), registration: DEMO_REGISTRATION },
   ...PIECES.map((def) => ({ id: def.id, title: def.title, subtitle: def.subtitle, composer: def.composer, dates: def.dates, source: def.source || null, build: () => compilePiece(def).score, registration: pieceRegistration(def) })),
 ];
 
@@ -1039,6 +1317,63 @@ const CSS = `
 }
 @media (max-width: 479px) { .rah-h1-suffix { display: none; } .rah-title h1 { font-size: 15px; } }
 @media (prefers-reduced-motion: reduce) { .rah-hint, .rah-ctl.rah-flash { animation: none; } }
+
+/* ---- Technik-Modus ----
+   Panel in the left column below the title / toggles / sound hint (top 158 px wide,
+   116 px once the hint is gone; narrow 160 / 96 px), 300 px wide (narrow ≤ 340 px), ends
+   84 px (narrow 72 px) above the bottom, i.e. above the view bar; 160 px when the
+   now-playing box is shown on screens < 1200 px. Wide: register panel starts at
+   100vw − 436 px, so ≥ 900 px there are ≥ 100 px between them. Narrow: an expanded
+   Technik panel collapses the register panel and vice versa (JS); < 600 px an expanded
+   register panel (full width from top 130) hides the Technik panel. */
+.rah-tk { --tk-top: 158px; --tk-bottom: 84px; position: absolute; left: 22px; top: var(--tk-top); width: 300px; max-width: calc(100vw - 44px); max-height: calc(100% - var(--tk-top) - var(--tk-bottom)); display: flex; flex-direction: column; overflow: hidden; }
+.rah-tk[hidden] { display: none; }
+.rah-root:has(.rah-hint.rah-gone) > .rah-tk { --tk-top: 116px; }
+@media (max-width: 1199px) { .rah-root:has(> .rah-now:not([hidden])) > .rah-tk { --tk-bottom: 160px; } }
+.rah-tk.rah-collapsed { width: auto; }
+.rah-tk.rah-collapsed .rah-tk-body { display: none; }
+.rah-tk.rah-collapsed .rah-chev { transform: rotate(-90deg); }
+.rah-tk .rah-panel-head .rah-h { letter-spacing: 0.16em; }
+.rah-tk-body { overflow-y: auto; min-height: 0; flex: 1 1 auto; padding: 4px 12px 10px; border-top: 1px solid rgba(217, 164, 65, 0.18); font-size: 13px; }
+.rah-tk-note { margin: 6px 0; font-size: 12.5px; font-style: italic; color: rgba(240, 230, 210, 0.7); }
+.rah-tk-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 6px 0 4px; padding: 0; border: 0; }
+.rah-tk-legend legend { padding: 0; margin-bottom: 3px; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: rgba(217, 164, 65, 0.85); }
+.rah-tk-sys { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; font-size: 13.5px; }
+.rah-tk-sys input { margin: 0; accent-color: var(--sys, #d9a441); cursor: pointer; }
+.rah-tk-sw { display: inline-block; width: 11px; height: 11px; border-radius: 2px; background: var(--sys, #d9a441); box-shadow: 0 0 6px var(--sys, #d9a441); }
+.rah-tk-tour { display: flex; align-items: center; gap: 6px; margin: 8px 0 4px; }
+.rah-tk-tour output { flex: 1 1 auto; text-align: center; font-size: 12px; color: rgba(240, 230, 210, 0.7); font-variant-numeric: tabular-nums; }
+.rah-tk-detail { margin: 4px 0 6px; padding: 6px 8px; min-height: 40px; border-left: 3px solid var(--sys, rgba(217, 164, 65, 0.5)); background: rgba(40, 26, 16, 0.45); border-radius: 0 4px 4px 0; }
+.rah-tk-detail b { display: block; font-weight: 400; font-size: 14px; color: #f3e3bd; }
+.rah-tk-detail small { display: block; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--sys, #d9a441); }
+.rah-tk-detail p { margin: 3px 0 0; font-size: 12.5px; line-height: 1.4; color: rgba(240, 230, 210, 0.85); white-space: pre-line; }
+.rah-tk-list ul { list-style: none; margin: 0 0 6px; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.rah-tk-list .rah-group-h { color: var(--sys, rgba(217, 164, 65, 0.85)); margin-top: 6px; }
+.rah-tk-st { width: 100%; text-align: left; padding: 4px 8px; font-size: 13px; background: rgba(40, 26, 16, 0.45); border: 1px solid rgba(217, 164, 65, 0.18); border-left: 3px solid var(--sys, #d9a441); border-radius: 3px; color: rgba(240, 230, 210, 0.88); }
+.rah-tk-st:hover { border-color: rgba(217, 164, 65, 0.6); border-left-color: var(--sys, #d9a441); }
+.rah-tk-st[aria-current="true"] { background: rgba(217, 164, 65, 0.2); color: #f8e7bf; }
+.rah-tk-st.rah-off { opacity: 0.45; }
+.rah-tk-facts { margin-top: 8px; border-top: 1px solid rgba(217, 164, 65, 0.18); padding-top: 6px; }
+.rah-tk-facts summary { cursor: pointer; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: #d9a441; }
+.rah-tk-facts h4 { margin: 8px 0 2px; font-size: 11px; font-weight: 400; letter-spacing: 0.12em; text-transform: uppercase; color: rgba(217, 164, 65, 0.85); }
+.rah-tk-facts ul { margin: 0; padding-left: 16px; font-size: 12.5px; line-height: 1.4; color: rgba(240, 230, 210, 0.82); }
+.rah-tk-facts a { color: #f3d48c; word-break: break-all; }
+.rah-tk-labels { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+.rah-tk-labels[hidden] { display: none; }
+.rah-tk-label { position: absolute; left: 0; top: 0; pointer-events: auto; display: inline-flex; align-items: center; gap: 5px; max-width: 200px; padding: 2px 8px 2px 6px; font-size: 12px; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #f0e6d2; background: rgba(14, 9, 7, 0.82); border: 1px solid var(--sys, #d9a441); border-radius: 999px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5); will-change: transform; }
+.rah-tk-label[hidden] { display: none; }
+.rah-tk-label::before { content: ''; flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--sys, #d9a441); }
+.rah-tk-label:hover, .rah-tk-label.rah-cur { background: rgba(40, 26, 16, 0.95); color: #f8e7bf; }
+.rah-tk-presets { display: contents; }
+.rah-tk-presets[hidden] { display: none; }
+.rah-tk-presets .rah-btn { border-color: var(--sys, rgba(217, 164, 65, 0.35)); }
+@media (max-width: 899px) {
+  .rah-tk { --tk-top: 160px; --tk-bottom: 72px; left: 12px; width: min(340px, calc(100vw - 24px)); max-width: none; }
+  .rah-root:has(.rah-hint.rah-gone) > .rah-tk { --tk-top: 96px; }
+  .rah-tk .rah-panel-head { padding: 7px 12px; }
+  .rah-tk-label { font-size: 11px; max-width: 150px; }
+}
+@media (max-width: 599px) { .rah-root:has(> .rah-panel:not(.rah-collapsed)) > .rah-tk { display: none; } }
 `;
 
 function el(tag, attrs = {}, children = []) {
@@ -1054,6 +1389,7 @@ function el(tag, attrs = {}, children = []) {
   return node;
 }
 
+const clearNode = (node) => { if (typeof node.replaceChildren === 'function') node.replaceChildren(); else node.textContent = ''; };
 const K = (s) => s.split(' ').map((k) => `<kbd>${k}</kbd>`).join('');
 const HELP_HTML_CONTROLS = `
 <h2>Bedienung</h2>
@@ -1064,7 +1400,7 @@ const HELP_HTML_CONTROLS = `
   <dt>Schwelltritte</dt><dd>Senkrecht ziehen oder Mausrad über dem Tritt: öffnet / schließt den Schwellkasten.</dd>
   <dt>Ansicht</dt><dd>Im freien Raum ziehen dreht die Kamera, Mausrad zoomt, Rechtsklick verschiebt. Über einem Bedienelement erscheint ein Hinweis.</dd>
   <dt>Ansichten</dt><dd>Leiste unten (auf schmalen Bildschirmen seitlich wischen): ${CAMERA_PRESETS.map((p) => `<b>${p.label}</b> – ${p.desc}`).join('; ')}.</dd>
-  <dt>Gehäuse</dt><dd>„Gehäuse ausblenden“ (oben links) blendet das Gehäuse aus und gibt den Blick auf das innere Pfeifenwerk frei; am besten zusammen mit der Ansicht <b>Pfeifenwerk</b>.</dd>
+  <dt>Gehäuse</dt><dd>„Gehäuse ausblenden“ (oben links) blendet das Gehäuse aus und gibt den Blick auf das innere Pfeifenwerk frei; am besten zusammen mit der Ansicht <b>Pfeifenwerk</b>. Daneben schaltet „Technik“ (${K(TECHNIK_KEY)}) den Technik-Modus (siehe unten).</dd>
 </dl>
 <h3>Tastatur – Spielen</h3>
 <dl>
@@ -1089,13 +1425,24 @@ const HELP_HTML_CONTROLS = `
   <dt>Kennzeichen</dt><dd>Zungenregister rot; „↗ aus Nr. n“ = Transmission oder Extension aus Register n (keine eigenen Pfeifen bzw. nur die Zusatzoktave).</dd>
   <dt>MIDI</dt><dd>Kanal 1 spielt das gewählte Manual, Kanal 2–5 Choir, Great, Swell, Solo, Kanal 6 das Pedal.</dd>
 </dl>
+<h3>Technik-Modus</h3>
+<dl>
+  <dt>Ein / aus</dt><dd>Knopf „Technik“ oben links (neben „Gehäuse ausblenden“) oder ${K(TECHNIK_KEY)}. Gehäuse, Pfeifen und Spieltisch werden durchscheinend, der Saal wird bis auf den Boden ausgeblendet; sichtbar werden die technischen Anlagen, farbig nach System: <b>Wind</b> blau, <b>Elektrik</b> gelb, <b>Mechanik</b> rot. Ausschalten stellt alles wieder her (auch den Zustand von „Gehäuse ausblenden“).</dd>
+  <dt>Technik-Tafel</dt><dd>Die Kontrollkästchen der Legende blenden einzelne Systeme ein oder aus. Ein Klick (oder ${K('Enter')}) auf eine Station fliegt die Kamera dorthin und zeigt ihre Erläuterung; ${K('↓')} ${K('↑')} wechseln in der Liste.</dd>
+  <dt>Tour</dt><dd>„‹ Zurück“ / „Weiter ›“ gehen die Stationen der Reihe nach durch; solange die Technik-Tafel den Fokus hat, auch ${K(',')} / ${K('.')} oder ${K('←')} / ${K('→')}.</dd>
+  <dt>Beschriftungen</dt><dd>Die Schilder im Bild bezeichnen die Baugruppen; ein Klick darauf fliegt zur Station.</dd>
+  <dt>Ansichten</dt><dd>Solange der Modus an ist, enthält die Leiste unten zusätzlich <b>${TECHNIK_OVERVIEW.label}</b> (${TECHNIK_OVERVIEW.desc}) und je eine Ansicht pro System.</dd>
+  <dt>Quellen</dt><dd>„Quellen &amp; Annahmen“ in der Tafel trennt Belegtes von Angenommenem und nennt die Quellen.</dd>
+  <dt>Spielen</dt><dd>Tasten, Registerzüge und Kolben bleiben anklickbar, Tastatur und MIDI spielen weiter; die Anlagen reagieren auf das Spiel.</dd>
+  <dt>Leistung</dt><dd>${K(PERF_KEY)} blendet eine kleine Leistungsanzeige ein (Bilder pro Sekunde, Bildzeit, Auflösungsfaktor, Zeichenaufrufe). Die Darstellung wird nur neu berechnet, wenn sich etwas ändert, und senkt bei Bedarf die Auflösung.</dd>
+</dl>
 <h3>Demo &amp; MIDI-Dateien</h3>
 <dl>
   <dt>Demo-Menü</dt><dd>„▶ Demo“ (Leiste unten) öffnet das Menü; mit der Tastatur ${K('Enter')} / ${K('Leertaste')} öffnen, ${K('↓')} ${K('↑')} wählen, ${K('Enter')} startet, ${K('Esc')} schließt. Während der Wiedergabe zeigt der Knopf „■ Stopp“ und den Titel; Klick darauf oder ${K('Esc')} beendet sie. Fortschritt und Dauer stehen darüber.</dd>
-  <dt>Eingebaute Stücke</dt><dd>Alle gemeinfrei (Komponisten seit über 70 Jahren tot); kurze Ausschnitte, jeweils mit eigener Registrierung (Register, Koppeln, Schweller, teils Wechsel während des Stücks):
+  <dt>Eingebaute Stücke</dt><dd>Gemeinfrei (Bach starb 1750; Notensatz gemeinfrei), mit eigener Registrierung (Register, Koppeln, Schweller, Wechsel während des Stücks):
     <ul>${DEMO_PIECES.map((p) => `<li><b>${p.title}</b> – ${p.subtitle}${p.source ? ` <small>(Quelle: ${p.source.credit}, ${p.source.licence})</small>` : ''}</li>`).join('')}</ul>
-    Bach BWV 565: Anfang der Toccata im Plenum, Schlussakkord mit Tubas über Kolben. Pachelbel: Bassfundament und die drei Oberstimmen im Kanon (Viertel-, dann Achtelvariation) wie in der Quelle, Stimmen auf Solo, Swell und Great, am Ende ein gehaltener Schlussakkord ergänzt. Bach BWV 147: Ritornell mit der Triolenlinie (Swell) und die ersten zwei Choralzeilen (Melodie auf der Solo-Oboe) wie in der Quelle; deren Klavierverdopplung des Chors entfällt, im letzten Takt hält das Pedal den Grundton. Elgar: die Trio-Melodie einmal ganz, Mittelstimmen vereinfacht, Schluss mit Tubas. Clarke: Hauptteil mit Wiederholung, erstes Couplet und Hauptteil, Melodie auf Solo-Trompete bzw. Tuba; Tenor und Bass eigene Harmonisierung.
-    Die eigene Registrierung (auch die Schwelltritte) wird danach wiederhergestellt; jede eigene Taste oder „■ Stopp“ beendet die Demo.</dd>
+    Vollständige Toccata und Fuge (143 Takte, rund 8½ Minuten), maschinell aus dem gemeinfreien Mutopia-Notensatz übernommen und Ton für Ton dagegen geprüft. Tempi, Fermaten, Verzierungen, Manualwechsel und die Registrierung (Plenum, leichtere Fuge, Schluss mit 32′ und Tubas) sind für dieses Modell eingerichtet.
+    Die eigene Registrierung (auch die Schwelltritte) wird danach wiederhergestellt; mitspielen ist möglich – nur „■ Stopp“ oder Esc beendet die Demo.</dd>
   <dt>Eigene MIDI-Datei</dt><dd>„Eigene MIDI-Datei laden…“ im Menü oder eine .mid/.midi-Datei einfach auf die Seite ziehen. Die Datei wird nur im Browser gelesen – sie bleibt auf deinem Gerät und wird weder hochgeladen noch gespeichert. Sie spielt mit der <b>aktuellen</b> Registrierung: Register dürfen währenddessen gezogen und eigene Töne gespielt werden, nur „■ Stopp“ oder ${K('Esc')} beendet sie.</dd>
   <dt>Zuordnung</dt><dd>Mehrere MIDI-Kanäle bzw. Spuren: 1. → Great, 2. → Swell, 3. → Choir, 4. → Solo (weitere → Great); ab drei Stimmen geht eine tiefe Basstimme ins Pedal. Sonst übernimmt das Pedal die tiefste Stimme unter c (MIDI 48). Kanal 10 (Schlagzeug) wird ignoriert; Töne außerhalb des Umfangs werden oktaviert (Manuale C–c′′′′, Pedal C–g′).</dd>
   <dt>Grenzen</dt><dd>Standard-MIDI-Dateien Format 0 und 1 (bis 4 MB); höchstens ${MIDI_MAX_POLYPHONY} gleichzeitige Töne (überzählige Mittelstimmen werden gekürzt), höchstens ${MIDI_MAX_SECONDS / 60} Minuten Wiedergabe. Tempowechsel werden berücksichtigt, Anschlagstärke, Pedal-, Programm- und Controller-Befehle nicht.</dd>
@@ -1300,7 +1647,7 @@ export function initInteraction(ctx) {
   }
   function playBuiltIn(id) {
     const def = DEMO_PIECES.find((x) => x.id === id) || DEMO_PIECES[0];
-    playPiece({ id: def.id, title: def.title, score: def.build(), registration: def.registration });
+    playPiece({ id: def.id, title: def.title, score: def.build(), registration: def.registration, keepOnUserInput: true });
   }
   /** bytes -> play; returns { ok, error? }. Never throws. */
   function playMidiBytes(name, bytes) {
@@ -1331,7 +1678,7 @@ export function initInteraction(ctx) {
     ui.now.hidden = false;
     ui.now.classList.remove('rah-error');
     ui.nowTitle.textContent = piece.title;
-    ui.nowNote.textContent = piece.keepRegistration ? 'Spielt mit deiner Registrierung – Register dürfen gezogen werden. Die Datei bleibt auf deinem Gerät.' : 'Registrierung wird danach wiederhergestellt; eine eigene Taste beendet die Demo.';
+    ui.nowNote.textContent = piece.keepRegistration ? 'Spielt mit deiner Registrierung – Register dürfen gezogen werden. Die Datei bleibt auf deinem Gerät.' : 'Mitspielen ist möglich. Registrierung wird danach wiederhergestellt; „■ Stopp“ oder Esc beendet die Demo.';
     if (piece.notices && piece.notices.length) ui.nowNote.textContent += ' ' + piece.notices.join(' ');
     ui.nowBar.hidden = false;
     nowShown = -1;
@@ -1403,12 +1750,22 @@ export function initInteraction(ctx) {
   const releaseUserNotes = () => book.releaseAll((s) => s !== 'demo');
 
   // ---- camera presets -----------------------------------------------------
+  // render-on-demand hooks provided by main.js (absent in tests / other hosts)
+  const requestRender = (s = 0) => { try { if (typeof ctx.requestRender === 'function') ctx.requestRender(s); } catch { /* ignore */ } };
+  const requestShadow = (s = 0) => { try { if (typeof ctx.requestShadowUpdate === 'function') ctx.requestShadowUpdate(s); } catch { /* ignore */ } };
   let camAnim = null;
+  /** animated camera flight (same easing / duration as the presets) to a { pos, target, fit? } view */
+  function flyTo(view) {
+    if (!view || !THREE) return false;
+    const pos = presetPosition(view, camera.fov, camera.aspect, Math.min(controls.maxDistance || 70, FIT_MAX_DISTANCE));
+    camAnim = { t: 0, fromPos: camera.position.clone(), fromTarget: controls.target.clone(), toPos: new THREE.Vector3(...pos), toTarget: new THREE.Vector3(...view.target) };
+    requestRender(0.2);
+    return true;
+  }
   function goToPreset(id) {
-    const p = CAMERA_PRESETS.find((x) => x.id === id);
-    if (!p || !THREE) return;
-    const pos = presetPosition(p, camera.fov, camera.aspect, Math.min(controls.maxDistance || 70, FIT_MAX_DISTANCE));
-    camAnim = { t: 0, fromPos: camera.position.clone(), fromTarget: controls.target.clone(), toPos: new THREE.Vector3(...pos), toTarget: new THREE.Vector3(...p.target) };
+    const p = CAMERA_PRESETS.find((x) => x.id === id) || (tk.on ? tk.presets.find((x) => x.id === id) : null);
+    if (!p) return false;
+    return flyTo(p);
   }
   updaters.push((time, dt) => {
     if (!camAnim) return;
@@ -1417,7 +1774,141 @@ export function initInteraction(ctx) {
     camera.position.lerpVectors(camAnim.fromPos, camAnim.toPos, k);
     controls.target.lerpVectors(camAnim.fromTarget, camAnim.toTarget, k);
     if (camAnim.t >= 1) camAnim = null;
+    requestRender(0.2); // let OrbitControls damping settle after the flight
   });
+
+  // ---- Technik-Modus ----------------------------------------------------------
+  const lateUpdaters = ctx.lateUpdaters || (ctx.lateUpdaters = []);
+  const tk = {
+    on: false, ghost: null, api: null, populated: false, stations: [], systems: [], presets: [], index: -1,
+    hidden: new Set(), labels: [], labelsDirty: true, sig: new Float64Array(34).fill(NaN),
+  };
+  function technikApi() {
+    const g = ctx.groups && ctx.groups.technik;
+    const a = g && g.userData && g.userData.api;
+    return a && typeof a === 'object' ? a : null;
+  }
+  function callTechnik(name, ...args) {
+    const a = technikApi();
+    const f = a && a[name];
+    if (typeof f !== 'function') return undefined;
+    try { return f.apply(a, args); } catch (err) { console.warn(`[Orgel] Technik ${name}:`, err); return undefined; }
+  }
+  function setTechnik(on) {
+    on = !!on;
+    if (on === tk.on) return false;
+    tk.on = on;
+    const g = ctx.groups && ctx.groups.technik;
+    if (on && (!tk.ghost || tk.ghostGroups !== ctx.groups || tk.ghostExclude !== g)) {
+      tk.ghost = createGhoster({ groups: ctx.groups || {}, exclude: g || null });
+      tk.ghostGroups = ctx.groups; tk.ghostExclude = g;
+    }
+    try { if (tk.ghost) { if (on) tk.ghost.apply(); else tk.ghost.restore(); } } catch (err) { console.warn('[Orgel] Durchsicht:', err); }
+    callTechnik('setActive', on);
+    if (g && typeof g === 'object' && 'visible' in g) g.visible = on; // the technik group is shown exactly while the mode is on
+    if (on) populateTechnik();
+    // narrow screens: never open on top of an expanded register panel
+    if (on && ui.tk && (window.innerWidth || 1200) < NARROW_PX && ui.panel && !ui.panel.classList.contains('rah-collapsed')) setTechnikCollapsed(true);
+    syncTechnikUI();
+    tk.labelsDirty = true;
+    requestShadow(0.2);
+    requestRender(1);
+    status(on ? `Technik-Modus: ${tk.systems.map((s) => s.label).join(', ') || 'Durchsicht'} (${TECHNIK_KEY})` : 'Technik-Modus aus');
+    return true;
+  }
+  const toggleTechnik = () => setTechnik(!tk.on);
+  /** read stations / systems / facts from the api (once per api object) and build the panel content */
+  function populateTechnik() {
+    const api = technikApi();
+    if (tk.populated && tk.api === api) return;
+    tk.populated = true; tk.api = api;
+    tk.systems = technikSystems(api);
+    tk.stations = technikStations(api);
+    tk.presets = technikPresets(api);
+    tk.index = -1;
+    tk.hidden.clear();
+    try { buildTechnikContent(api); } catch (err) { console.warn('[Orgel] Technik-Tafel:', err); }
+  }
+  function sysOf(id) { return tk.systems.find((s) => s.id === id) || null; }
+  function setSystemVisible(id, on) {
+    on = !!on;
+    if (on) tk.hidden.delete(id); else tk.hidden.add(id);
+    callTechnik('setSystemVisible', id, on);
+    for (const L of tk.labels) if (L.st.system === id) L.off = !on;
+    for (const b of ui.tkStationBtns || []) if (b.getAttribute('data-system') === id) b.classList.toggle('rah-off', !on);
+    for (const cb of ui.tkChecks || []) if (cb.getAttribute('data-system') === id && cb.checked !== on) cb.checked = on;
+    tk.labelsDirty = true;
+    requestShadow(0.2);
+    requestRender(0.5);
+  }
+  function selectStation(i, { fly = true, focus = false } = {}) {
+    const st = tk.stations[i];
+    if (!st) return false;
+    tk.index = i;
+    const sys = sysOf(st.system);
+    if (ui.tkDetail) {
+      ui.tkDetail.style.setProperty?.('--sys', sys ? sys.color : '#d9a441');
+      ui.tkDetailSys.textContent = sys ? sys.label : st.system;
+      ui.tkDetailTitle.textContent = st.title;
+      ui.tkDetailText.textContent = st.text || '';
+    }
+    if (ui.tkCounter) ui.tkCounter.textContent = `${i + 1} / ${tk.stations.length}`;
+    (ui.tkStationBtns || []).forEach((b, k) => { if (k === i) b.setAttribute('aria-current', 'true'); else b.removeAttribute('aria-current'); });
+    for (const L of tk.labels) L.el.classList.toggle('rah-cur', L.st === st);
+    if (focus && ui.tkStationBtns && ui.tkStationBtns[i]) ui.tkStationBtns[i].focus();
+    if (fly && st.view) flyTo(st.view);
+    return true;
+  }
+  function tourStep(dir, focus = false) {
+    const n = tk.stations.length;
+    if (!n) return false;
+    const i = tk.index < 0 ? (dir > 0 ? 0 : n - 1) : (tk.index + (dir > 0 ? 1 : -1) + n) % n;
+    return selectStation(i, { fly: true, focus });
+  }
+  function technikAnimating() {
+    if (!tk.on) return false;
+    const a = technikApi();
+    if (a && typeof a.isAnimating === 'function') { try { return !!a.isAnimating(); } catch { return true; } }
+    return !!a; // unknown: the module animates itself while active -> keep rendering
+  }
+  function setTechnikCollapsed(c) {
+    if (!ui.tk) return;
+    ui.tk.classList.toggle('rah-collapsed', c);
+    ui.tkHead.setAttribute('aria-expanded', c ? 'false' : 'true');
+    if (!c && (window.innerWidth || 1200) < NARROW_PX && ui.panel && !ui.panel.classList.contains('rah-collapsed')) setCollapsed(true);
+  }
+  function syncTechnikUI() {
+    if (ui.tkBtn) {
+      ui.tkBtn.setAttribute('aria-pressed', tk.on ? 'true' : 'false');
+      ui.tkBtn.title = tk.on ? `Technik-Modus beenden (${TECHNIK_KEY})` : `Technik-Modus: Wind, Elektrik und Mechanik sichtbar machen (${TECHNIK_KEY})`;
+    }
+    if (ui.tk) ui.tk.hidden = !tk.on;
+    if (ui.tkLabels) ui.tkLabels.hidden = !tk.on;
+    if (ui.tkPresets) ui.tkPresets.hidden = !tk.on;
+  }
+  // DOM labels projected from station.position (one late updater; only while the mode is on)
+  function updateTechnikLabels() {
+    if (!tk.on || !tk.labels.length) return;
+    if (typeof camera.updateMatrixWorld === 'function') camera.updateMatrixWorld();
+    const v = camera.matrixWorldInverse && camera.matrixWorldInverse.elements;
+    const p = camera.projectionMatrix && camera.projectionMatrix.elements;
+    if (!v || !p) return;
+    const w = window.innerWidth || 0, h = window.innerHeight || 0;
+    const s = tk.sig;
+    let same = !tk.labelsDirty && s[32] === w && s[33] === h;
+    for (let i = 0; i < 16 && same; i++) same = s[i] === v[i] && s[16 + i] === p[i];
+    if (same) return;
+    for (let i = 0; i < 16; i++) { s[i] = v[i]; s[16 + i] = p[i]; }
+    s[32] = w; s[33] = h;
+    tk.labelsDirty = false;
+    for (const L of tk.labels) {
+      const q = !L.off && L.st.position ? projectToNdc(L.st.position, v, p) : null;
+      const show = !!q && Math.abs(q.x) <= 1.02 && Math.abs(q.y) <= 1.02;
+      if (show) L.el.style.transform = `translate(${(((q.x + 1) / 2) * w).toFixed(1)}px, ${(((1 - q.y) / 2) * h).toFixed(1)}px) translate(-50%, -130%)`;
+      if (L.el.hidden === show) L.el.hidden = !show;
+    }
+  }
+  lateUpdaters.push(updateTechnikLabels);
 
   // ---- picking --------------------------------------------------------------
   const raycaster = THREE ? new THREE.Raycaster() : null;
@@ -1630,6 +2121,7 @@ export function initInteraction(ctx) {
     if (isTyping(target)) return; // the search field handles its own keys; no notes while typing
     if (e.ctrlKey || e.metaKey || e.altKey) return;
 
+    if (code === TECHNIK_KEY || key === TECHNIK_KEY) { e.preventDefault(); if (!e.repeat) toggleTechnik(); return; }
     if ((key === '/' && !code.startsWith('Digit')) || code === 'NumpadDivide') { e.preventDefault(); focusSearch(); return; }
     if (key === '?') { e.preventDefault(); toggleHelp(); return; }
     const mi = KEY_MANUAL_CODES.indexOf(code);
@@ -1802,6 +2294,8 @@ export function initInteraction(ctx) {
     if (!ui.panel) return;
     ui.panel.classList.toggle('rah-collapsed', c);
     ui.panelHead.setAttribute('aria-expanded', c ? 'false' : 'true');
+    // narrow screens: register panel and Technik panel never both expanded
+    if (!c && (window.innerWidth || 1200) < NARROW_PX && ui.tk && !ui.tk.classList.contains('rah-collapsed')) setTechnikCollapsed(true);
   }
   function selectTab(id, focus = false) {
     if (!ui.tabEls) return;
@@ -1981,6 +2475,10 @@ export function initInteraction(ctx) {
     if (!document.getElementById('rah-style')) document.head.append(el('style', { id: 'rah-style', text: CSS }));
     const narrow = (window.innerWidth || 1200) < NARROW_PX;
     const root = el('div', { class: 'rah-root' });
+    // Technik labels: lowest layer, above the canvas only
+    ui.tkLabels = el('div', { class: 'rah-tk-labels' });
+    ui.tkLabels.hidden = true;
+    root.append(ui.tkLabels);
     const c = META.counts;
     const de = (n) => n.toLocaleString('de-DE');
 
@@ -2116,6 +2614,34 @@ export function initInteraction(ctx) {
     body.append(foot);
     panel.append(head, body);
     root.append(panel);
+
+    // Technik panel (content built on first activation, see buildTechnikContent)
+    const tkPanel = el('section', { class: 'rah-tk rah-glass' + (narrow ? ' rah-collapsed' : ''), id: 'rah-technik', 'aria-label': 'Technik-Modus' });
+    tkPanel.hidden = true;
+    ui.tk = tkPanel;
+    ui.tkHead = el('button', { class: 'rah-panel-head', type: 'button', 'aria-expanded': narrow ? 'false' : 'true', 'aria-controls': 'rah-tk-body', title: 'Technik-Tafel ein- oder ausklappen' }, [
+      el('span', { class: 'rah-h', text: 'Technik' }),
+      el('span', { class: 'rah-chev', text: '▼', 'aria-hidden': 'true' }),
+    ]);
+    ui.tkHead.addEventListener('click', () => setTechnikCollapsed(!tkPanel.classList.contains('rah-collapsed')));
+    ui.tkBody = el('div', { class: 'rah-tk-body', id: 'rah-tk-body' });
+    tkPanel.append(ui.tkHead, ui.tkBody);
+    tkPanel.addEventListener('keydown', (e) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const k = e.key;
+      const t = e.target;
+      const stop = () => { e.preventDefault(); e.stopPropagation(); };
+      const onStation = !!(t && t.hasAttribute && t.hasAttribute('data-station'));
+      if (k === ',' || k === '.' || k === 'ArrowLeft' || k === 'ArrowRight') { stop(); tourStep(k === '.' || k === 'ArrowRight' ? 1 : -1, onStation); return; }
+      if ((k === 'ArrowDown' || k === 'ArrowUp') && onStation) {
+        stop();
+        const list = ui.tkStationBtns || [];
+        const i = list.indexOf(t);
+        const j = Math.max(0, Math.min(list.length - 1, i + (k === 'ArrowDown' ? 1 : -1)));
+        if (list[j]) list[j].focus();
+      }
+    });
+    root.append(tkPanel);
     // crossing into the narrow layout collapses the panel once (it would cover the view)
     let wasNarrow = narrow;
     window.addEventListener?.('resize', () => {
@@ -2138,6 +2664,9 @@ export function initInteraction(ctx) {
       b.addEventListener('click', () => goToPreset(p.id));
       bar.append(b);
     }
+    ui.tkPresets = el('span', { class: 'rah-tk-presets', role: 'group', 'aria-label': 'Technik-Ansichten' });
+    ui.tkPresets.hidden = true;
+    bar.append(ui.tkPresets);
     bar.append(el('span', { class: 'rah-sep' }));
     ui.demoBtn = el('button', { class: 'rah-btn rah-demo-btn', type: 'button', text: '▶ Demo', 'aria-pressed': 'false', 'aria-haspopup': 'menu', 'aria-expanded': 'false', 'aria-controls': 'rah-demo-menu', title: 'Demo-Stück wählen oder eigene MIDI-Datei spielen' });
     let kbdAt = -1e9; // a handled Enter/Space keydown suppresses the browser's synthetic click
@@ -2167,7 +2696,7 @@ export function initInteraction(ctx) {
       ui.menuItems.push(it);
       return it;
     };
-    menu.append(el('div', { class: 'rah-mh', text: 'Demo-Stücke · gemeinfrei, Ausschnitte für dieses Modell eingerichtet' }));
+    menu.append(el('div', { class: 'rah-mh', text: 'Demo · gemeinfrei, notengetreu nach Mutopia' }));
     for (const p of DEMO_PIECES) menu.append(item({ 'data-piece': p.id }, `▶ ${p.title}`, p.subtitle));
     menu.append(el('div', { class: 'rah-msep', role: 'separator' }));
     menu.append(item({ 'data-action': 'file' }, 'Eigene MIDI-Datei laden…', `.mid / .midi, auch per Ziehen & Ablegen · spielt mit deiner Registrierung · max. ${MIDI_MAX_SECONDS / 60} Minuten`));
@@ -2239,6 +2768,108 @@ export function initInteraction(ctx) {
 
     host.append(root);
     ui.root = root;
+
+    // Toggle row under the title (index.html styles #rah-toggles; main.js puts #case-toggle in front)
+    const toggles = el('div', { id: 'rah-toggles', role: 'group', 'aria-label': 'Durchsicht' });
+    ui.tkBtn = el('button', { id: 'technik-toggle', type: 'button', 'aria-pressed': 'false', 'aria-controls': 'rah-technik', text: 'Technik' });
+    ui.tkBtn.addEventListener('click', () => { toggleTechnik(); });
+    toggles.append(ui.tkBtn);
+    host.append(toggles);
+    ui.toggles = toggles;
+    syncTechnikUI();
+  }
+
+  /** Technik panel content, bar presets and 3D labels from the technik api (null -> note only) */
+  function buildTechnikContent(api) {
+    if (!ui.tkBody) return;
+    const body = ui.tkBody;
+    clearNode(body);
+    ui.tkChecks = []; ui.tkStationBtns = [];
+    if (!api) body.append(el('p', { class: 'rah-tk-note', text: 'Das Technik-Modell ist nicht geladen – nur die Durchsicht durch Gehäuse und Pfeifen ist aktiv.' }));
+    // legend
+    if (api) {
+      const legend = el('fieldset', { class: 'rah-tk-legend' }, [el('legend', { text: 'Systeme' })]);
+      for (const s of tk.systems) {
+        const cb = el('input', { type: 'checkbox', 'data-system': s.id, 'aria-label': `${s.label} anzeigen` });
+        cb.checked = true;
+        cb.addEventListener('change', () => setSystemVisible(s.id, cb.checked));
+        ui.tkChecks.push(cb);
+        legend.append(el('label', { class: 'rah-tk-sys', style: `--sys:${s.color}` }, [cb, el('span', { class: 'rah-tk-sw', 'aria-hidden': 'true' }), el('span', { text: s.label })]));
+      }
+      body.append(legend);
+    }
+    // tour + detail
+    if (tk.stations.length) {
+      const prev = el('button', { class: 'rah-btn rah-small', type: 'button', text: '‹ Zurück', title: 'Vorige Station (, oder ←)', 'data-tour': 'prev' });
+      const next = el('button', { class: 'rah-btn rah-small', type: 'button', text: 'Weiter ›', title: 'Nächste Station (. oder →)', 'data-tour': 'next' });
+      prev.addEventListener('click', () => tourStep(-1));
+      next.addEventListener('click', () => tourStep(1));
+      ui.tkCounter = el('output', { text: `– / ${tk.stations.length}`, 'aria-live': 'off' });
+      body.append(el('div', { class: 'rah-tk-tour', role: 'group', 'aria-label': 'Tour durch die Stationen' }, [prev, ui.tkCounter, next]));
+      ui.tkDetailSys = el('small', { text: 'Tour' });
+      ui.tkDetailTitle = el('b', { text: 'Station wählen' });
+      ui.tkDetailText = el('p', { text: 'Eine Station anklicken oder mit „Weiter ›“ die Tour beginnen.' });
+      ui.tkDetail = el('div', { class: 'rah-tk-detail', role: 'status', 'aria-live': 'polite' }, [ui.tkDetailSys, ui.tkDetailTitle, ui.tkDetailText]);
+      body.append(ui.tkDetail);
+      // station list grouped by system
+      const list = el('div', { class: 'rah-tk-list' });
+      const groups = [...tk.systems, ...[...new Set(tk.stations.map((s) => s.system))].filter((id) => !sysOf(id)).map((id) => ({ id, label: id || 'Weitere', color: '#d9a441' }))];
+      for (const s of groups) {
+        const sts = tk.stations.filter((st) => st.system === s.id);
+        if (!sts.length) continue;
+        const gid = `rah-tk-g-${String(s.id).replace(/[^a-z0-9]/gi, '')}`;
+        const ul = el('ul', { 'aria-labelledby': gid });
+        for (const st of sts) {
+          const idx = tk.stations.indexOf(st);
+          const b = el('button', { class: 'rah-tk-st', type: 'button', 'data-station': st.id, 'data-system': st.system, style: `--sys:${s.color}`, title: st.text ? `${st.title}\n${st.text}` : st.title, text: st.title });
+          b.addEventListener('click', () => selectStation(idx));
+          ui.tkStationBtns[idx] = b;
+          ul.append(el('li', {}, [b]));
+        }
+        list.append(el('div', { class: 'rah-group-h', id: gid, style: `--sys:${s.color}`, text: s.label }), ul);
+      }
+      body.append(list);
+    } else if (api) body.append(el('p', { class: 'rah-tk-note', text: 'Das Technik-Modell liefert keine Stationen.' }));
+    // sources & assumptions
+    if (api) body.append(factsSection(api.facts));
+    // bar presets
+    if (ui.tkPresets) {
+      clearNode(ui.tkPresets);
+      for (const p of tk.presets) {
+        const b = el('button', { class: 'rah-btn', type: 'button', text: p.label, 'data-preset': p.id, title: `${p.label}: ${p.desc}`, style: p.color ? `--sys:${p.color}` : undefined });
+        b.addEventListener('click', () => { const i = p.station ? tk.stations.findIndex((s) => s.id === p.station) : -1; if (i >= 0) selectStation(i); else goToPreset(p.id); });
+        ui.tkPresets.append(b);
+      }
+    }
+    // 3D labels
+    if (ui.tkLabels) {
+      clearNode(ui.tkLabels);
+      tk.labels = [];
+      tk.stations.forEach((st, idx) => {
+        if (!st.position) return;
+        const s = sysOf(st.system);
+        const b = el('button', { class: 'rah-tk-label', type: 'button', tabindex: '-1', 'aria-hidden': 'true', style: `--sys:${s ? s.color : '#d9a441'}`, title: st.title, text: st.title });
+        b.hidden = true;
+        b.addEventListener('click', () => selectStation(idx));
+        ui.tkLabels.append(b);
+        tk.labels.push({ st, el: b, off: false });
+      });
+      tk.labelsDirty = true;
+    }
+  }
+  function factsSection(facts) {
+    const strs = (a) => (Array.isArray(a) ? a.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim()) : []);
+    const f = facts && typeof facts === 'object' ? facts : {};
+    const sourced = strs(f.sourced), assumed = strs(f.assumed), sources = strs(f.sources);
+    const det = el('details', { class: 'rah-tk-facts' }, [el('summary', { text: 'Quellen & Annahmen' })]);
+    if (!sourced.length && !assumed.length && !sources.length) { det.append(el('p', { class: 'rah-tk-note', text: 'Das Technik-Modell macht keine Angaben zu Quellen – alles Gezeigte ist als Annahme zu verstehen.' })); return det; }
+    const list = (items) => el('ul', {}, items.map((t) => el('li', { text: t })));
+    det.append(el('h4', { text: 'Belegt (mit Quelle)' }), sourced.length ? list(sourced) : el('p', { class: 'rah-tk-note', text: 'keine Angaben' }));
+    det.append(el('h4', { text: 'Angenommen (plausibel, nicht belegt)' }), assumed.length ? list(assumed) : el('p', { class: 'rah-tk-note', text: 'keine Angaben' }));
+    if (sources.length) {
+      det.append(el('h4', { text: 'Quellen' }), el('ul', {}, sources.map((u) => el('li', {}, [/^https?:\/\//i.test(u) ? el('a', { href: u, target: '_blank', rel: 'noopener noreferrer', text: u }) : u]))));
+    }
+    return det;
   }
 
   try { buildUI(); } catch (err) { console.warn('[Orgel] UI konnte nicht aufgebaut werden:', err); }
@@ -2257,7 +2888,16 @@ export function initInteraction(ctx) {
     couplers: () => COUPLERS.map((c) => c.id).filter((id) => reg.couplers.has(id)),
     tremulants: () => TREMULANT_IDS.filter((id) => reg.tremulants.has(id)),
     swell: (id) => swell.get(id),
-    goToPreset,
+    goToPreset, flyTo,
+    isFlying: () => !!camAnim,
+    /** frame loop: true while something animates continuously (camera flight, demo / MIDI playback, Technik animation) */
+    isAnimating: () => !!camAnim || demo.isPlaying() || technikAnimating(),
+    setTechnik, toggleTechnik, isTechnik: () => tk.on,
+    technik: {
+      stations: () => tk.stations, systems: () => tk.systems, presets: () => tk.presets, current: () => tk.index,
+      select: (i) => selectStation(i), tour: (dir) => tourStep(dir), setSystemVisible, ghost: () => tk.ghost,
+      updateLabels: updateTechnikLabels,
+    },
     playBuiltIn, playMidiBytes, playMidiFile, openDemoMenu, closeDemoMenu, isDemoMenuOpen: () => menuOpen,
     allNotesOff() { demo.stop(); panic(); audio.allNotesOff(); tracker.releaseAll(); },
   };
