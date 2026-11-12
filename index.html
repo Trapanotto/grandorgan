@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Royal Albert Hall – Die Orgel</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0a0706; overflow: hidden; font-family: Georgia, 'Times New Roman', serif; color: #f0e6d2; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+  #ui { position: fixed; inset: 0; pointer-events: none; }
+  #ui > * { pointer-events: auto; }
+  /* Case toggle (created in main.js). Styled like the register panel (.rah-glass /
+     .rah-btn in interaction.js) and parked in the top-left column directly under the
+     title, where interaction.js reserves a slot for it (wide: top 72–104 px, narrow
+     < 900 px: top 56–84 px). It therefore never meets the bottom view bar, the panel
+     (top-right) or the sound hint (below the slot) at any width. */
+  #case-toggle { position: fixed; left: 22px; top: 72px; margin: 0; box-sizing: border-box; max-width: calc(100vw - 44px);
+    font-family: 'Cormorant Garamond', 'EB Garamond', Georgia, 'Times New Roman', serif; font-size: 13px; line-height: 18px; letter-spacing: .05em;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #f0e6d2;
+    background: rgba(14, 9, 7, .8); border: 1px solid rgba(217, 164, 65, .32); border-radius: 6px; padding: 6px 12px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, .5); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+    cursor: pointer; -webkit-user-select: none; user-select: none; transition: background .2s, border-color .2s, color .2s; }
+  #case-toggle::before { content: '\25A3'; margin-right: 7px; color: #d9a441; font-size: 11px; }
+  #case-toggle:hover { border-color: #d9a441; color: #f3d48c; }
+  #case-toggle:focus-visible { outline: 2px solid #f3d48c; outline-offset: 1px; }
+  #case-toggle[aria-pressed="true"] { background: #d9a441; border-color: #d9a441; color: #1a0f08; }
+  #case-toggle[aria-pressed="true"]::before { content: '\25A1'; color: #1a0f08; }
+  @media (max-width: 899px) {
+    #case-toggle { left: 12px; top: 56px; max-width: calc(100vw - 24px); font-size: 12px; line-height: 16px; padding: 5px 10px; }
+  }
+  #loading { position: fixed; inset: 0; display: grid; place-items: center; font-size: 18px; letter-spacing: .08em; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+<div id="ui"></div>
+<div id="loading">Die Orgel wird aufgebaut …</div>
+<script type="module" src="./js/main.js"></script>
+</body>
+</html>
